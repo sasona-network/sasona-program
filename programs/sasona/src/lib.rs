@@ -20,7 +20,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::pubkey;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
 declare_id!("7eiHSnDkM4WjJdY36D2Yqsjw893mCMUtBAwMCQ5adL99");
 
@@ -55,6 +55,34 @@ pub const FREE_BPS: u64 = 1_000;
 
 const _: () = assert!(SPREAD_BPS + GUARANTEE_BPS + FREE_BPS == 10_000);
 const _: () = assert!(FEE_BPS < 10_000);
+
+/// A purchase carries a markup of fifteen points over the seller's price, all
+/// of it paid in dollars. Five of the fifteen are the reserve: they stay in
+/// the pool as depth and nothing is minted against them. Three percent of the
+/// fifteen is burned. The rest buys coin from the pool for the participants.
+pub const MARKUP_POINTS: u64 = 15;
+pub const RESERVE_POINTS: u64 = 5;
+pub const BURN_BPS: u64 = 300;
+
+/// How the participants' coin is shared, in points.
+///
+/// NOTE, temporary: none of these roles exists on chain yet. A share whose
+/// role nobody filled goes to the network, so for now the network receives
+/// all of it, and the network's coin waits in a vault that has no way out.
+/// Both change when the parts that bring developers, miners, submitters and
+/// marketers on chain are built.
+pub const DEVELOPER_POINTS: u64 = 4;
+pub const MINERS_POINTS: u64 = 2;
+pub const SUBMITTER_POINTS: u64 = 1;
+pub const MARKETER_POINTS: u64 = 1;
+pub const NETWORK_POINTS: u64 = 2;
+
+const _: () = assert!(
+    RESERVE_POINTS + DEVELOPER_POINTS + MINERS_POINTS + SUBMITTER_POINTS + MARKETER_POINTS + NETWORK_POINTS
+        == MARKUP_POINTS
+);
+
+pub const NETWORK_SEED: &[u8] = b"network";
 
 #[program]
 pub mod sasona {
@@ -180,6 +208,170 @@ pub mod sasona {
         });
         Ok(())
     }
+
+    /// Pay the markup on a purchase, in dollars.
+    ///
+    /// `markup` is the fifteen points, not the seller's price. The reserve
+    /// comes off the top and is added to the pool as depth first. The rest
+    /// then buys coin from the deeper pool, which moves the price up; the
+    /// burn's share of that coin is destroyed and the remainder goes to the
+    /// participants.
+    ///
+    /// Not yet tied to a real purchase: any caller can pay any markup. While
+    /// every coin it buys goes to the network vault that is harmless. It must
+    /// be tied to purchases before participant seats are paid, or paying a
+    /// "fee" becomes a way for a participant to buy coin.
+    pub fn pay_fee(ctx: Context<PayFee>, markup: u64) -> Result<()> {
+        require!(markup > 0, SasonaError::NothingDeposited);
+        let f = Fee::of(markup)?;
+
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer {
+                    from: a.payer_usd.to_account_info(),
+                    to: a.pool_usd.to_account_info(),
+                    authority: a.payer.to_account_info(),
+                },
+            ),
+            markup,
+        )?;
+
+        let pool = &mut ctx.accounts.pool;
+        pool.usd_reserve = add(pool.usd_reserve, f.reserve)?;
+        let (burned, shared) = buy_and_share(
+            &mut ctx.accounts.pool,
+            &ctx.accounts.token_program,
+            &ctx.accounts.coin_mint,
+            &ctx.accounts.pool_coin,
+            &ctx.accounts.network,
+            f.buy(),
+            f.burn,
+        )?;
+
+        ctx.accounts.coin_mint.reload()?;
+        ctx.accounts.pool_usd.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+
+        emit!(FeePaid { payer: a.payer.key(), markup, reserve: f.reserve, burned, shared });
+        Ok(())
+    }
+
+    /// Turn the entry fees that deposits have left waiting into coin.
+    ///
+    /// The same as a fee, without the reserve, which belongs to the markup on
+    /// purchases only. Anyone may call it; it moves only the pool's own money.
+    pub fn settle_entry_fees(ctx: Context<SettleEntryFees>) -> Result<()> {
+        let amount = ctx.accounts.pool.fees_held;
+        require!(amount > 0, SasonaError::NothingDeposited);
+        let burn = burn_of(amount)?;
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer {
+                    from: a.fees.to_account_info(),
+                    to: a.pool_usd.to_account_info(),
+                    authority: a.pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+            amount,
+        )?;
+        ctx.accounts.pool.fees_held = 0;
+
+        let (burned, shared) = buy_and_share(
+            &mut ctx.accounts.pool,
+            &ctx.accounts.token_program,
+            &ctx.accounts.coin_mint,
+            &ctx.accounts.pool_coin,
+            &ctx.accounts.network,
+            amount,
+            burn,
+        )?;
+
+        ctx.accounts.coin_mint.reload()?;
+        ctx.accounts.pool_usd.reload()?;
+        ctx.accounts.fees.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+
+        emit!(EntryFeesSettled { amount, burned, shared });
+        Ok(())
+    }
+}
+
+/// Buy coin from the pool with `dollars` that have already arrived in its
+/// dollar account, burn the `burn` dollars' share of it, and send the rest
+/// to the participants. Returns (coins burned, coins shared).
+///
+/// The price follows the pool's recorded reserves, constant product, rounded
+/// in the pool's favour. The product of the reserves may only grow.
+fn buy_and_share<'info>(
+    pool: &mut Account<'info, Pool>,
+    token_program: &Program<'info, Token>,
+    coin_mint: &Account<'info, Mint>,
+    pool_coin: &Account<'info, TokenAccount>,
+    network: &Account<'info, TokenAccount>,
+    dollars: u64,
+    burn: u64,
+) -> Result<(u64, u64)> {
+    let (usd, coins) = (pool.usd_reserve, pool.coin_reserve);
+    let out = coins_out(dollars, usd, coins)?;
+    require!(out > 0, SasonaError::TooSmall);
+    // Rounded up, like the burn itself: the burn is never less than its share.
+    let burned = u64::try_from((out as u128 * burn as u128).div_ceil(dollars as u128))
+        .map_err(|_| SasonaError::Overflow)?;
+    let shared = out - burned;
+
+    pool.usd_reserve = add(usd, dollars)?;
+    pool.coin_reserve = coins - out;
+    pool.outside = add(pool.outside, shared)?;
+    require!(
+        pool.usd_reserve as u128 * pool.coin_reserve as u128 >= usd as u128 * coins as u128,
+        SasonaError::PriceMoved
+    );
+
+    let bump = [pool.bump];
+    let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+    let signer: &[&[&[u8]]] = &[seeds];
+    if burned > 0 {
+        token::burn(
+            CpiContext::new(
+                token_program.key(),
+                Burn {
+                    mint: coin_mint.to_account_info(),
+                    from: pool_coin.to_account_info(),
+                    authority: pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+            burned,
+        )?;
+    }
+    if shared > 0 {
+        // Every participant seat is empty for now, so all of it is the
+        // network's. See the note on DEVELOPER_POINTS.
+        token::transfer(
+            CpiContext::new(
+                token_program.key(),
+                Transfer {
+                    from: pool_coin.to_account_info(),
+                    to: network.to_account_info(),
+                    authority: pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+            shared,
+        )?;
+    }
+    Ok((burned, shared))
 }
 
 // ------------------------------------------------------------------ accounts
@@ -333,6 +525,71 @@ impl<'info> Deposit<'info> {
     }
 }
 
+#[derive(Accounts)]
+pub struct PayFee<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(address = pool.usd_mint @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = payer)]
+    pub payer_usd: Account<'info, TokenAccount>,
+
+    /// Read only, so the end-of-instruction check covers every account.
+    #[account(seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    /// The network's coin. Held by the pool, with no instruction that moves
+    /// it out yet; see the note on DEVELOPER_POINTS.
+    #[account(init_if_needed, payer = payer, seeds = [NETWORK_SEED], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub network: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettleEntryFees<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = caller, seeds = [NETWORK_SEED], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub network: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
 // --------------------------------------------------------------------- state
 
 #[account]
@@ -397,7 +654,64 @@ pub struct Deposited {
     pub guarantee_coins: u64,
 }
 
+#[event]
+pub struct FeePaid {
+    pub payer: Pubkey,
+    pub markup: u64,
+    pub reserve: u64,
+    pub burned: u64,
+    pub shared: u64,
+}
+
+#[event]
+pub struct EntryFeesSettled {
+    pub amount: u64,
+    pub burned: u64,
+    pub shared: u64,
+}
+
 // ---------------------------------------------------------------- arithmetic
+
+/// The markup on a purchase, cut into its three uses, in dollars. The
+/// participants' part is what is left, so the three always add back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fee {
+    pub reserve: u64,
+    pub burn: u64,
+    pub participants: u64,
+}
+
+impl Fee {
+    pub fn of(markup: u64) -> Result<Self> {
+        let reserve = u64::try_from(markup as u128 * RESERVE_POINTS as u128 / MARKUP_POINTS as u128)
+            .map_err(|_| SasonaError::Overflow)?;
+        let burn = burn_of(markup)?.min(markup - reserve);
+        let participants = markup
+            .checked_sub(reserve)
+            .and_then(|x| x.checked_sub(burn))
+            .ok_or(SasonaError::Overflow)?;
+        Ok(Self { reserve, burn, participants })
+    }
+
+    /// The dollars that buy coin: the burn's and the participants'.
+    pub fn buy(&self) -> u64 {
+        self.burn + self.participants
+    }
+}
+
+/// The burn's share of an amount, rounded up so that it is never less than
+/// three percent, however small the payment.
+pub fn burn_of(amount: u64) -> Result<u64> {
+    let v = (amount as u128 * BURN_BPS as u128).div_ceil(10_000);
+    u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
+}
+
+/// Coins out of the pool for `dollars` in, at constant product, rounded down.
+pub fn coins_out(dollars: u64, usd: u64, coins: u64) -> Result<u64> {
+    require!(usd > 0, SasonaError::PoolEmpty);
+    let v = coins as u128 * dollars as u128 / (usd as u128 + dollars as u128);
+    u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
+}
 
 /// A deposit cut into its four parts. `free` is what is left after the other
 /// two, so the parts always add back to the deposit exactly.

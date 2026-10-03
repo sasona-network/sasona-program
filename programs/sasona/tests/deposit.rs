@@ -9,15 +9,6 @@ fn opened() -> World {
     w
 }
 
-/// Everything the pool records must match what the token program holds.
-fn assert_books_balance(svm: &LiteSVM) {
-    let p = pool(svm);
-    assert_eq!(mint_state(svm, pda(&[COIN_SEED])).supply, p.coin_reserve + p.outside, "supply");
-    assert_eq!(token_balance(svm, pda(&[POOL_COIN_SEED])), p.coin_reserve, "pool coins");
-    assert!(token_balance(svm, pda(&[POOL_USD_SEED])) >= p.usd_reserve, "pool dollars");
-    assert!(token_balance(svm, pda(&[FEES_SEED])) >= p.fees_held, "fees");
-}
-
 // ----------------------------------------------------------------- it works
 
 #[test]

@@ -12,7 +12,7 @@ pub use solana_signer::Signer;
 pub use solana_transaction::Transaction;
 pub use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint};
 
-pub use sasona::{at_price, 
+pub use sasona::{at_price, burn_of, coins_out, Fee, NETWORK_SEED, BURN_BPS, 
     Guarantee, Pool, Slices, COIN_DECIMALS, COIN_SEED, FEES_SEED, GUARANTEE_SEED, OPENING_COINS_PER_USD,
     POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED,
 };
@@ -205,4 +205,64 @@ pub fn try_deposit(svm: &mut LiteSVM, who: &Keypair, from: Address, amount: u64)
 
 pub fn pool(svm: &LiteSVM) -> Pool {
     read(svm, pda(&[POOL_SEED]))
+}
+
+fn metas(accounts: Vec<anchor_lang::prelude::AccountMeta>) -> Vec<AccountMeta> {
+    accounts
+        .into_iter()
+        .map(|m| AccountMeta { pubkey: addr(m.pubkey), is_signer: m.is_signer, is_writable: m.is_writable })
+        .collect()
+}
+
+pub fn pay_fee_ix(who: Address, usd_mint: Address, from: Address, markup: u64) -> Instruction {
+    let accounts = sasona::accounts::PayFee {
+        payer: key(who),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        usd_mint: key(usd_mint),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        pool_coin: key(pda(&[POOL_COIN_SEED])),
+        payer_usd: key(from),
+        fees: key(pda(&[FEES_SEED])),
+        network: key(pda(&[NETWORK_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::PayFee { markup }.data() }
+}
+
+pub fn settle_ix(caller: Address) -> Instruction {
+    let accounts = sasona::accounts::SettleEntryFees {
+        caller: key(caller),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        pool_coin: key(pda(&[POOL_COIN_SEED])),
+        fees: key(pda(&[FEES_SEED])),
+        network: key(pda(&[NETWORK_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SettleEntryFees {}.data() }
+}
+
+pub fn try_pay_fee(svm: &mut LiteSVM, who: &Keypair, from: Address, markup: u64) -> Result<(), String> {
+    svm.expire_blockhash();
+    send(svm, pay_fee_ix(who.pubkey(), usd(), from, markup), &[who])
+}
+
+pub fn try_settle(svm: &mut LiteSVM, who: &Keypair) -> Result<(), String> {
+    svm.expire_blockhash();
+    send(svm, settle_ix(who.pubkey()), &[who])
+}
+
+/// Everything the pool records must match what the token program holds.
+pub fn assert_books_balance(svm: &LiteSVM) {
+    let p = pool(svm);
+    assert_eq!(mint_state(svm, pda(&[COIN_SEED])).supply, p.coin_reserve + p.outside, "supply");
+    assert_eq!(token_balance(svm, pda(&[POOL_COIN_SEED])), p.coin_reserve, "pool coins");
+    assert!(token_balance(svm, pda(&[POOL_USD_SEED])) >= p.usd_reserve, "pool dollars");
+    assert!(token_balance(svm, pda(&[FEES_SEED])) >= p.fees_held, "fees");
 }

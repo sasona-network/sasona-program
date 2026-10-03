@@ -2,6 +2,8 @@
 //!
 //!     sasona open <dollars> --keypair <path>
 //!     sasona deposit <dollars> --keypair <path>
+//!     sasona fee <dollars of markup> --keypair <path>
+//!     sasona settle --keypair <path>
 //!
 //! The keypair signs and pays. It must hold the devnet dollar in its
 //! associated token account. Prints the transaction signature.
@@ -12,12 +14,14 @@ use anchor_client::anchor_lang::prelude::Pubkey;
 use anchor_client::{Client, Cluster, CommitmentConfig};
 use anchor_spl::associated_token::get_associated_token_address;
 use sasona::{
-    COIN_SEED, FEES_SEED, GUARANTEE_SEED, POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED,
+    COIN_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT,
+    VAULT_SEED,
 };
 use solana_keypair::read_keypair_file;
 use solana_signer::Signer;
 
-const USAGE: &str = "usage: sasona <open|deposit> <dollars> --keypair <path> [--url <rpc>]";
+const USAGE: &str = "usage: sasona <open|deposit|fee> <dollars> --keypair <path> [--url <rpc>]
+       sasona settle --keypair <path> [--url <rpc>]";
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
@@ -30,11 +34,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if command != "open" && command != "deposit" {
+    if !["open", "deposit", "fee", "settle"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = args.get(2).and_then(|s| s.parse().ok()).expect(USAGE);
+    let dollars: f64 = if command == "settle" { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair = read_keypair_file(arg(&args, "--keypair").expect(USAGE)).expect("cannot read keypair");
     let cluster = match arg(&args, "--url") {
@@ -67,6 +71,36 @@ fn main() {
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
             .args(sasona::instruction::Open { amount })
+    } else if command == "fee" {
+        request
+            .accounts(sasona::accounts::PayFee {
+                payer: me,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                usd_mint: USD_MINT,
+                pool_usd: pda(&[POOL_USD_SEED]),
+                pool_coin: pda(&[POOL_COIN_SEED]),
+                payer_usd: get_associated_token_address(&me, &USD_MINT),
+                fees: pda(&[FEES_SEED]),
+                network: pda(&[NETWORK_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::PayFee { markup: amount })
+    } else if command == "settle" {
+        request
+            .accounts(sasona::accounts::SettleEntryFees {
+                caller: me,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                pool_usd: pda(&[POOL_USD_SEED]),
+                pool_coin: pda(&[POOL_COIN_SEED]),
+                fees: pda(&[FEES_SEED]),
+                network: pda(&[NETWORK_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::SettleEntryFees {})
     } else {
         request
             .accounts(sasona::accounts::Deposit {
