@@ -20,6 +20,7 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | Instruction | What it does |
 |---|---|
 | `open` | Creates the coin and the pool, and makes the first deposit. The dollar and the opening price are fixed in the program, so whoever opens it gains nothing by going first. |
+| `deposit` | Deposits into the open pool at the pool's own price. The pool mints its side to match, so the price does not move. A repeat deposit adds to the same guarantee. |
 
 A deposit is split four ways:
 
@@ -45,3 +46,7 @@ bash scripts/mutate.sh
 ```
 
 This breaks the program in specific ways, one at a time, and checks that the tests catch each one.
+
+## Known limit
+
+At 5,000 coins a dollar the coin's supply counter fills after about $2 billion of total deposits. The price or the coin's decimals will be set before mainnet so that limit is out of reach.
