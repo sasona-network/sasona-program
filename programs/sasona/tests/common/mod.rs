@@ -266,3 +266,23 @@ pub fn assert_books_balance(svm: &LiteSVM) {
     assert!(token_balance(svm, pda(&[POOL_USD_SEED])) >= p.usd_reserve, "pool dollars");
     assert!(token_balance(svm, pda(&[FEES_SEED])) >= p.fees_held, "fees");
 }
+
+pub fn add_depth_ix(who: Address, usd_mint: Address, from: Address, amount: u64) -> Instruction {
+    let accounts = sasona::accounts::AddDepth {
+        giver: key(who),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        usd_mint: key(usd_mint),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        fees: key(pda(&[FEES_SEED])),
+        giver_usd: key(from),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AddDepth { amount }.data() }
+}
+
+pub fn try_add_depth(svm: &mut LiteSVM, who: &Keypair, from: Address, amount: u64) -> Result<(), String> {
+    svm.expire_blockhash();
+    send(svm, add_depth_ix(who.pubkey(), usd(), from, amount), &[who])
+}

@@ -305,6 +305,37 @@ pub mod sasona {
         emit!(EntryFeesSettled { amount, burned, shared });
         Ok(())
     }
+
+    /// Add dollars to the pool and nothing else.
+    ///
+    /// Nothing is minted against them, so the same coins are backed by more
+    /// money and the price rises. It is the one way to make the pool absorb
+    /// a larger sale without handing anybody a claim on it. Anyone may call
+    /// it, because a caller can only give.
+    pub fn add_depth(ctx: Context<AddDepth>, amount: u64) -> Result<()> {
+        require!(amount > 0, SasonaError::NothingDeposited);
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer {
+                    from: a.giver_usd.to_account_info(),
+                    to: a.pool_usd.to_account_info(),
+                    authority: a.giver.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        let pool = &mut ctx.accounts.pool;
+        pool.usd_reserve = add(pool.usd_reserve, amount)?;
+
+        ctx.accounts.pool_usd.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+
+        emit!(DepthAdded { giver: a.giver.key(), amount });
+        Ok(())
+    }
 }
 
 /// Buy coin from the pool with `dollars` that have already arrived in its
@@ -590,6 +621,33 @@ pub struct SettleEntryFees<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct AddDepth<'info> {
+    pub giver: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    /// Read only: there is no coin account here at all, so this instruction
+    /// cannot move a coin even if its arithmetic were wrong.
+    #[account(address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(address = pool.usd_mint @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = giver)]
+    pub giver_usd: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 // --------------------------------------------------------------------- state
 
 #[account]
@@ -661,6 +719,12 @@ pub struct FeePaid {
     pub reserve: u64,
     pub burned: u64,
     pub shared: u64,
+}
+
+#[event]
+pub struct DepthAdded {
+    pub giver: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
