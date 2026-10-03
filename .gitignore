@@ -1,0 +1,13 @@
+# Build output. The build runs outside this folder; nothing it writes belongs here.
+target/
+.anchor/
+node_modules/
+test-ledger/
+
+# Keypairs never enter this repository, under any name.
+*keypair*.json
+id.json
+deployer*.json
+*.key
+*.pem
+.env*

@@ -1,0 +1,16 @@
+[toolchain]
+solana_version = "4.1.2"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+sasona = "7eiHSnDkM4WjJdY36D2Yqsjw893mCMUtBAwMCQ5adL99"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/sasona/devnet-deployer.json"
+
+[scripts]
+test = "cargo test"

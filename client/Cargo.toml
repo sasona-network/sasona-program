@@ -1,0 +1,17 @@
+[package]
+name = "sasona-client"
+version = "0.1.0"
+description = "Send Sasona instructions to devnet"
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "sasona"
+path = "src/main.rs"
+
+[dependencies]
+sasona = { path = "../programs/sasona", features = ["no-entrypoint"] }
+anchor-client = "1.2.0"
+anchor-spl = { version = "1.2.0", features = ["token", "associated_token"] }
+solana-keypair = "3"
+solana-signer = "3"
