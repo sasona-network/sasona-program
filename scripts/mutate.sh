@@ -29,6 +29,19 @@ MUTANTS=(
   "fee kept in the pool's reserve|s/(a\.cpi_transfer\(&a\.depositor_usd, )&a\.fees(, a\.depositor\.to_account_info\(\)\), s\.fee)/\${1}&a.pool_usd\${2}/"
   "free coins minted twice|s/(token::mint_to\(a\.cpi_mint\(&a\.depositor_coin\)\.with_signer\(signer\), )free_coins\)/\${1}free_coins * 2)/"
   "a key can freeze the coin|s/mint::decimals = COIN_DECIMALS, mint::authority = pool\)/mint::decimals = COIN_DECIMALS, mint::authority = pool, mint::freeze_authority = depositor)/"
+  "deposit: pool side rounded up|s/let into_pool = at_price\(s\.rest, coin_before, usd_before\)\?;/let into_pool = at_price(s.rest, coin_before, usd_before)? + 1;/"
+  "deposit: pool side rounded up, price check removed|s/let into_pool = at_price\(s\.rest, coin_before, usd_before\)\?;/let into_pool = at_price(s.rest, coin_before, usd_before)? + 1;/; s/\s*pool\.price_held\(usd_before, coin_before\)\?;//"
+  "deposit: dollars not recorded|s/pool\.usd_reserve = add\(usd_before, s\.rest\)\?;/pool.usd_reserve = usd_before;/"
+  "deposit: a second deposit replaces the guarantee|s/g\.coins = add\(g\.coins, guarantee_coins\)\?;/g.coins = guarantee_coins;/"
+  "deposit: any token accepted as the dollar|s/#\[account\(address = pool\.usd_mint @ SasonaError::NotTheDollar\)\]\s*//"
+  "deposit: depositor's dollars not checked for owner|s/(pub struct Deposit.*?)token::mint = usd_mint, token::authority = depositor/\${1}token::mint = usd_mint/s"
+  "deposit: guarantee vault held by the depositor|s/(pub struct Deposit.*?VAULT_SEED, depositor\.key\(\)\.as_ref\(\)\], bump,\s+token::mint = coin_mint, token::authority = )pool/\${1}depositor/s"
+  "deposit: fee kept in the pool's reserve|s/(pub fn deposit.*?a\.cpi_transfer\(&a\.depositor_usd, )&a\.fees/\${1}&a.pool_usd/s"
+  "deposit: tiny deposits allowed|s/\s*require!\(s\.fee > 0 && free_coins > 0 && guarantee_coins > 0, SasonaError::TooSmall\);//"
+  "deposit: deposits too small for a fee allowed|s/require!\(s\.fee > 0 && /require!(/"
+  "deposit: pool's coin account not pinned|s/#\[account\(mut, seeds = \[POOL_COIN_SEED\], bump\)\]/#[account(mut)]/"
+  "deposit: fee account not pinned|s/#\[account\(mut, seeds = \[FEES_SEED\], bump\)\]/#[account(mut)]/"
+  "deposit: pool's dollar account not pinned|s/#\[account\(mut, seeds = \[POOL_USD_SEED\], bump\)\]/#[account(mut)]/"
 )
 
 # Fresh copy of the source, keeping target/ so each build is incremental.
@@ -40,8 +53,8 @@ reset() {
 }
 
 build() { (cd "$WORK" && rm -f "$SO" && anchor build >/dev/null 2>&1) && [ -f "$SO" ]; }
-tests_compile() { (cd "$WORK" && cargo test -q -p sasona --test open --no-run >/dev/null 2>&1); }
-tests_pass() { (cd "$WORK" && SASONA_SO="$SO" cargo test -q -p sasona --test open -- --test-threads=1 >/dev/null 2>&1); }
+tests_compile() { (cd "$WORK" && cargo test -q -p sasona --no-run >/dev/null 2>&1); }
+tests_pass() { (cd "$WORK" && SASONA_SO="$SO" cargo test -q -p sasona -- --test-threads=1 >/dev/null 2>&1); }
 
 reset
 if ! build || ! tests_compile || ! tests_pass; then

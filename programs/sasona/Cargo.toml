@@ -20,7 +20,7 @@ custom-heap = []
 custom-panic = []
 
 [dependencies]
-anchor-lang = "1.2.0"
+anchor-lang = { version = "1.2.0", features = ["init-if-needed"] }
 anchor-spl = { version = "1.2.0", features = ["token", "associated_token"] }
 
 [dev-dependencies]
@@ -34,6 +34,7 @@ solana-address = { version = "2.7", features = ["curve25519"] }
 solana-account = "4"
 solana-program-pack = "3"
 spl-token-interface = "2"
+spl-associated-token-account-interface = "2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

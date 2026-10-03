@@ -121,6 +121,65 @@ pub mod sasona {
         });
         Ok(())
     }
+
+    /// Deposit into an open pool.
+    ///
+    /// The same four slices as the opening, priced at the pool's own ratio of
+    /// coins to dollars. The pool's side is minted to match what it receives,
+    /// so a deposit does not move the price. Rounding always goes down: the
+    /// depositor can receive a fraction of a coin unit less, never more, and
+    /// the price can only drift up, by less than one unit.
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        require!(amount > 0, SasonaError::NothingDeposited);
+        let s = Slices::of(amount)?;
+
+        let (usd_before, coin_before) = (ctx.accounts.pool.usd_reserve, ctx.accounts.pool.coin_reserve);
+        let into_pool = at_price(s.rest, coin_before, usd_before)?;
+        let free_coins = at_price(s.free, coin_before, usd_before)?;
+        let guarantee_coins = at_price(s.guarantee, coin_before, usd_before)?;
+        require!(s.fee > 0 && free_coins > 0 && guarantee_coins > 0, SasonaError::TooSmall);
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let a = &ctx.accounts;
+        token::transfer(a.cpi_transfer(&a.depositor_usd, &a.pool_usd, a.depositor.to_account_info()), s.rest)?;
+        token::transfer(a.cpi_transfer(&a.depositor_usd, &a.fees, a.depositor.to_account_info()), s.fee)?;
+        token::mint_to(a.cpi_mint(&a.pool_coin).with_signer(signer), into_pool)?;
+        token::mint_to(a.cpi_mint(&a.depositor_coin).with_signer(signer), free_coins)?;
+        token::mint_to(a.cpi_mint(&a.guarantee_vault).with_signer(signer), guarantee_coins)?;
+
+        let pool = &mut ctx.accounts.pool;
+        pool.usd_reserve = add(usd_before, s.rest)?;
+        pool.coin_reserve = add(coin_before, into_pool)?;
+        pool.outside = add(pool.outside, add(free_coins, guarantee_coins)?)?;
+        pool.fees_held = add(pool.fees_held, s.fee)?;
+        pool.price_held(usd_before, coin_before)?;
+
+        // A first deposit creates the guarantee; a later one adds to it.
+        let g = &mut ctx.accounts.guarantee;
+        if g.owner == Pubkey::default() {
+            g.owner = ctx.accounts.depositor.key();
+            g.bump = ctx.bumps.guarantee;
+        }
+        g.coins = add(g.coins, guarantee_coins)?;
+
+        ctx.accounts.coin_mint.reload()?;
+        ctx.accounts.pool_usd.reload()?;
+        ctx.accounts.fees.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+
+        emit!(Deposited {
+            depositor: a.depositor.key(),
+            amount,
+            into_pool,
+            free_coins,
+            guarantee_coins,
+        });
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ accounts
@@ -204,6 +263,76 @@ impl<'info> Open<'info> {
     }
 }
 
+#[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(address = pool.usd_mint @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = depositor)]
+    pub depositor_usd: Account<'info, TokenAccount>,
+
+    /// These three already exist if this depositor has deposited before, and
+    /// then the constraints are checked against what is there.
+    #[account(init_if_needed, payer = depositor,
+              associated_token::mint = coin_mint, associated_token::authority = depositor)]
+    pub depositor_coin: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = depositor, seeds = [VAULT_SEED, depositor.key().as_ref()], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub guarantee_vault: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = depositor, space = 8 + Guarantee::INIT_SPACE,
+              seeds = [GUARANTEE_SEED, depositor.key().as_ref()], bump)]
+    pub guarantee: Account<'info, Guarantee>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> Deposit<'info> {
+    fn cpi_transfer(
+        &self,
+        from: &Account<'info, TokenAccount>,
+        to: &Account<'info, TokenAccount>,
+        authority: AccountInfo<'info>,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.key(),
+            Transfer { from: from.to_account_info(), to: to.to_account_info(), authority },
+        )
+    }
+
+    fn cpi_mint(&self, to: &Account<'info, TokenAccount>) -> CpiContext<'_, '_, '_, 'info, MintTo<'info>> {
+        CpiContext::new(
+            self.token_program.key(),
+            MintTo {
+                mint: self.coin_mint.to_account_info(),
+                to: to.to_account_info(),
+                authority: self.pool.to_account_info(),
+            },
+        )
+    }
+}
+
 // --------------------------------------------------------------------- state
 
 #[account]
@@ -230,6 +359,16 @@ impl Pool {
         require!(fees >= self.fees_held, SasonaError::DollarsMissing);
         Ok(())
     }
+
+    /// After a deposit the price may not fall, and may rise by less than one
+    /// coin unit's worth. With C/U before and C'/U' after, that is
+    /// 0 <= C*U' - C'*U < U.
+    pub fn price_held(&self, usd_before: u64, coin_before: u64) -> Result<()> {
+        let before = coin_before as u128 * self.usd_reserve as u128;
+        let after = self.coin_reserve as u128 * usd_before as u128;
+        require!(before >= after && before - after < usd_before as u128, SasonaError::PriceMoved);
+        Ok(())
+    }
 }
 
 #[account]
@@ -247,6 +386,15 @@ pub struct Opened {
     pub depositor: Pubkey,
     pub amount: u64,
     pub coins_per_usd: u64,
+}
+
+#[event]
+pub struct Deposited {
+    pub depositor: Pubkey,
+    pub amount: u64,
+    pub into_pool: u64,
+    pub free_coins: u64,
+    pub guarantee_coins: u64,
 }
 
 // ---------------------------------------------------------------- arithmetic
@@ -281,6 +429,13 @@ pub fn bps(amount: u64, bps: u64) -> Result<u64> {
     u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
 }
 
+/// Dollars converted to coins at the ratio coins/usd, rounded down.
+pub fn at_price(dollars: u64, coins: u64, usd: u64) -> Result<u64> {
+    require!(usd > 0, SasonaError::PoolEmpty);
+    let v = dollars as u128 * coins as u128 / usd as u128;
+    u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
+}
+
 fn times(a: u64, b: u64) -> Result<u64> {
     a.checked_mul(b).ok_or(SasonaError::Overflow.into())
 }
@@ -301,6 +456,12 @@ pub enum SasonaError {
     SupplyMismatch,
     #[msg("The pool holds fewer dollars than it has recorded")]
     DollarsMissing,
+    #[msg("Too small to give any coins at the current price")]
+    TooSmall,
+    #[msg("A deposit moved the price")]
+    PriceMoved,
+    #[msg("The pool holds no dollars to price against")]
+    PoolEmpty,
     #[msg("Arithmetic overflow")]
     Overflow,
 }
