@@ -666,3 +666,18 @@ fn a_member_who_asked_to_leave_insures_nothing_more() {
     let err = buy(&mut m, &buyer, 1, PRICE).unwrap_err();
     assert!(err.contains("NotActive"), "{err}");
 }
+
+#[test]
+fn the_price_goes_only_to_the_address_the_reading_recorded() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let usd_acc = ata(buyer.pubkey(), usd());
+    let mut ix = buy_ix(&m.w.svm, buyer.pubkey(), usd_acc, m.reading, 1, PRICE);
+    let merchant = merchant_usd(&mut m.w.svm);
+    let at = ix.accounts.iter().position(|a| a.pubkey == merchant).unwrap();
+    // The buyer names themselves as the merchant, to be paid their own price.
+    let own = new_buyer(&mut m.w.svm, 0);
+    ix.accounts[at].pubkey = ata(own.pubkey(), usd());
+    let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("NotThePayTo"), "{err}");
+}
