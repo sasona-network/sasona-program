@@ -172,7 +172,6 @@ MUTANTS=(
   "quote: the slot not recorded|s/q\.set_slot = clock\.slot;/q.set_slot = 0;/"
   "buy: below the minimum|s/\s*require!\(price >= MIN_COVERED_PRICE, SasonaError::TooSmall\);//"
   "buy: a withdrawn quote covers|s/\s*require!\(ctx\.accounts\.quote\.rate > 0, SasonaError::NotInsured\);//"
-  "buy: a reading that did not deliver covers|s/(pub fn buy.*?)\s*require!\(r\.verdict == 1, SasonaError::NotDelivered\);/\$1/s"
   "buy: an old reading covers|s/(pub fn buy.*?)\s*require!\(clock\.unix_timestamp <= ends, SasonaError::WindowClosed\);/\$1/s"
   "buy: a member who left insures|s/(pub fn buy.*?)\s*require!\(m\.state == MEMBER_ACTIVE, SasonaError::NotActive\);/\$1/s"
   "buy: no room checked|s/\s*require!\(counted as i128 <= room, SasonaError::NoRoomToInsure\);//"

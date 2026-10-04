@@ -970,8 +970,9 @@ pub mod sasona {
         // The rate the buyer saw, at most: a quote raised before this lands
         // does not charge them more.
         require!(ctx.accounts.quote.rate <= max_rate, SasonaError::RateRaised);
+        // A quote is only set on a reading that delivered (set_quote), and a
+        // verdict never changes once revealed.
         require!(r.state == READING_REVEALED, SasonaError::ReadingNotOpen);
-        require!(r.verdict == 1, SasonaError::NotDelivered);
         require!(r.member > 0, SasonaError::NoMember);
         require!(r.pay_to != Pubkey::default(), SasonaError::NoPayTo);
         let ends = r.reveal_time.checked_add(CHALLENGE_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;

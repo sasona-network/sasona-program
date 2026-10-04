@@ -656,3 +656,13 @@ fn an_upheld_challenge_pays_the_debt_first_and_the_challenger_a_tenth_of_the_res
     assert_eq!(cover(&m.w.svm).coins, cover_before);
     assert_eq!((book(&m.w.svm, 1).owed_coins, chargeback(&m.w.svm, purchase).owed_coins), (0, 0));
 }
+
+#[test]
+fn a_member_who_asked_to_leave_insures_nothing_more() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let quoter = m.quoter.insecure_clone();
+    try_with(&mut m.w.svm, |s| ask_to_leave_ix(s, quoter.pubkey(), 1), &quoter).unwrap();
+    let err = buy(&mut m, &buyer, 1, PRICE).unwrap_err();
+    assert!(err.contains("NotActive"), "{err}");
+}
