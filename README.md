@@ -43,6 +43,7 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `open_evidence`, `write_evidence` | The reader puts a reading's reply on chain, in pieces. |
 | `answer_challenge` | Holds if the reply on chain hashes to what was recorded and gives the recorded verdict for the nonce. The bond goes to the member and the reply is sealed. |
 | `uphold_challenge` | After 7 days with no answer that held: the reading stops counting and the membership loses its stake, a tenth to the challenger and the rest held. |
+| `set_quote` | The member who took a reading sets, changes or withdraws what they would charge to insure a purchase from the service, in basis points. Only on a reading that says delivered, within 30 days, while the member is active. |
 
 A deposit is split four ways:
 
