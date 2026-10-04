@@ -566,7 +566,7 @@ pub mod sasona {
         question_hash: [u8; 32],
     ) -> Result<()> {
         let a = &ctx.accounts;
-        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, a.reader.key(), ctx.remaining_accounts, None)?;
+        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, &a.seat, a.reader.key(), ctx.remaining_accounts, None)?;
         let a = &mut *ctx.accounts;
         start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)?;
         a.reading.member = a.member.number;
@@ -642,7 +642,7 @@ pub mod sasona {
         let first_key = first.key();
         let first_reader = first.reader;
         let a = &ctx.accounts;
-        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, a.reader.key(), ctx.remaining_accounts, Some(first_reader))?;
+        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, &a.seat, a.reader.key(), ctx.remaining_accounts, Some(first_reader))?;
 
         let a = &mut *ctx.accounts;
         start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)?;
@@ -712,6 +712,7 @@ pub mod sasona {
         let s = &mut ctx.accounts.seat;
         s.member = number;
         s.owner = owner;
+        s.since = Clock::get()?.slot;
         s.bump = ctx.bumps.seat;
         emit!(MemberJoined { owner, number, seat, stake: MEMBER_STAKE });
         Ok(())
@@ -1174,6 +1175,7 @@ fn unseat(members: &mut Members, member: &mut Member, accounts: &[AccountInfo]) 
         require!(mover.number == last_seat.member && mover.seat == last, SasonaError::NotTheSeat);
         seat.member = last_seat.member;
         seat.owner = last_seat.owner;
+        seat.since = Clock::get()?.slot;
         mover.seat = k;
         last_seat.member = 0;
         last_seat.owner = Pubkey::default();
@@ -1186,24 +1188,30 @@ fn unseat(members: &mut Members, member: &mut Member, accounts: &[AccountInfo]) 
     Ok(())
 }
 
-/// Refuse unless `member`, held by `reader`, sits in the seat drawn for this
-/// service now (SPEC.md 4.3), and the round's window to read is open. Seats
-/// drawn before it that exist now come in `skipped`, in order: each must
-/// hold the first reading's reader, the only reason to pass one over.
+/// Refuse unless `member`, held by `reader`, sits in `seat`, the seat drawn
+/// for this service now (SPEC.md 4.3), and the round's window to read is
+/// open. Seats drawn before it that exist now come in `skipped`, in order:
+/// each must hold the first reading's reader, or a membership that sat down
+/// after the round was committed. Those are the only reasons to pass one over.
+#[allow(clippy::too_many_arguments)]
 fn check_drawn(
     round: &Round,
     members: &Members,
     endpoint_hash: &[u8; 32],
     member: &Member,
+    seat: &Seat,
     reader: Pubkey,
     skipped: &[AccountInfo],
     first_reader: Option<Pubkey>,
 ) -> Result<()> {
     require!(round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
-    require!(Clock::get()?.slot <= round.entropy_slot + READ_WINDOW_SLOTS, SasonaError::WindowClosed);
+    let closes = round.entropy_slot.checked_add(READ_WINDOW_SLOTS).ok_or(SasonaError::Overflow)?;
+    require!(Clock::get()?.slot <= closes, SasonaError::WindowClosed);
     require!(round.members > 0, SasonaError::NotDrawn);
     require_keys_eq!(member.owner, reader, SasonaError::NotTheReader);
     require!(member.state == MEMBER_ACTIVE && member.seat > 0, SasonaError::NotActive);
+    require!(seat.member == member.number, SasonaError::NotTheSeat);
+    require!(seat.since < round.commit_slot, SasonaError::SatDownSince);
     let mut shown = 0usize;
     for attempt in 0..MAX_READER_ATTEMPTS {
         let k = reader_number(&round.final_seed, endpoint_hash, attempt, round.members);
@@ -1217,7 +1225,7 @@ fn check_drawn(
         let info = skipped.get(shown).ok_or(SasonaError::NotSkippable)?;
         shown += 1;
         let s = seat_at(info, k)?;
-        require!(Some(s.owner) == first_reader, SasonaError::NotSkippable);
+        require!(s.since >= round.commit_slot || Some(s.owner) == first_reader, SasonaError::NotSkippable);
     }
     err!(SasonaError::NotDrawn)
 }
@@ -1637,6 +1645,10 @@ pub struct CommitReading<'info> {
     #[account(seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump)]
     pub member: Account<'info, Member>,
 
+    /// The seat it sits in.
+    #[account(seeds = [SEAT_SEED, member.seat.to_le_bytes().as_ref()], bump = seat.bump)]
+    pub seat: Account<'info, Seat>,
+
     #[account(init, payer = reader, space = 8 + Reading::INIT_SPACE,
               seeds = [READING_SEED, round.key().as_ref(), endpoint_hash.as_ref()], bump)]
     pub reading: Account<'info, Reading>,
@@ -1678,6 +1690,10 @@ pub struct CommitSecondReading<'info> {
     /// The reader's membership, the one drawn for this service.
     #[account(seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump)]
     pub member: Account<'info, Member>,
+
+    /// The seat it sits in.
+    #[account(seeds = [SEAT_SEED, member.seat.to_le_bytes().as_ref()], bump = seat.bump)]
+    pub seat: Account<'info, Seat>,
 
     #[account(init, payer = reader, space = 8 + Reading::INIT_SPACE,
               seeds = [READING_SEED, round.key().as_ref(), endpoint_hash.as_ref()], bump)]
@@ -2161,6 +2177,9 @@ pub struct Member {
 pub struct Seat {
     pub member: u32,
     pub owner: Pubkey,
+    /// The slot the membership sat down here, by joining or moving up. It
+    /// reads only for rounds committed after it (SPEC.md 4.2).
+    pub since: u64,
     pub bump: u8,
 }
 
@@ -2656,6 +2675,8 @@ pub enum SasonaError {
     EvidenceSealed,
     #[msg("The time allowed for this has passed")]
     WindowClosed,
+    #[msg("This membership sat down in its seat after the round was committed")]
+    SatDownSince,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

@@ -122,7 +122,7 @@ fn main() {
     let members_now = || -> sasona::Members { program.account(pda(&[MEMBERS_SEED])).expect("members") };
     // SPEC.md 4.3: this keypair's membership if its seat was drawn for the
     // service, and the seats passed over that have to be shown.
-    let drawn = |round: &Pubkey, endpoint_hash: &[u8; 32], first_reader: Option<Pubkey>| -> (Pubkey, Vec<AccountMeta>) {
+    let drawn = |round: &Pubkey, endpoint_hash: &[u8; 32], first_reader: Option<Pubkey>| -> (Pubkey, Pubkey, Vec<AccountMeta>) {
         let r: sasona::Round = program.account(*round).expect("round");
         assert!(r.members > 0, "nobody was a member when this round was opened");
         let seated = members_now().seated;
@@ -133,13 +133,13 @@ fn main() {
                 continue;
             }
             let s: sasona::Seat = program.account(seat_pda(k)).expect("seat");
-            if Some(s.owner) == first_reader {
+            if s.since >= r.commit_slot || Some(s.owner) == first_reader {
                 skipped.push(AccountMeta::new_readonly(seat_pda(k), false));
                 continue;
             }
             assert_eq!(s.owner, me, "seat {k} was drawn for this service, and it is not yours");
             eprintln!("drawn: seat {k}, membership {}", s.member);
-            return (member_pda(s.member), skipped);
+            return (member_pda(s.member), seat_pda(k), skipped);
         }
         panic!("no seat qualified in {} attempts: nobody reads this service in this round", sasona::MAX_READER_ATTEMPTS);
     };
@@ -426,13 +426,14 @@ fn main() {
         let round: Pubkey = args[2].parse().expect("round address");
         let endpoint = args[3].clone();
         let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
-        let (member, skipped) = drawn(&round, &endpoint_hash, None);
+        let (member, seat, skipped) = drawn(&round, &endpoint_hash, None);
         request
             .accounts(sasona::accounts::CommitReading {
                 reader: me,
                 round,
                 members: pda(&[MEMBERS_SEED]),
                 member,
+                seat,
                 reading: pda(&[READING_SEED, round.as_ref(), &endpoint_hash]),
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
@@ -460,13 +461,14 @@ fn main() {
         let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
         let reading = pda(&[READING_SEED, round.as_ref(), &endpoint_hash]);
         let first: Pubkey = args[5].parse().expect("first reading address");
-        let (member, skipped) = drawn(&round, &endpoint_hash, Some(reading_of(&first).reader));
+        let (member, seat, skipped) = drawn(&round, &endpoint_hash, Some(reading_of(&first).reader));
         request
             .accounts(sasona::accounts::CommitSecondReading {
                 reader: me,
                 round,
                 members: pda(&[MEMBERS_SEED]),
                 member,
+                seat,
                 reading,
                 first,
                 pair: pda(&[PAIR_SEED, reading.as_ref()]),

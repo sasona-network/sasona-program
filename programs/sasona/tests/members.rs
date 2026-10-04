@@ -279,16 +279,22 @@ fn the_seats_shown_must_be_the_ones_drawn() {
 }
 
 #[test]
-fn a_member_who_leaves_after_the_draw_hands_on_the_seat() {
+fn a_member_who_moves_up_after_the_draw_does_not_read_for_that_round() {
     let mut w = world_with_member();
     let d = w.depositor.insecure_clone();
     let (b, _) = new_member(&mut w.svm);
     let round = round_drawing_first(&mut w, &d, 2, 1);
     try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
     assert_seat(&w.svm, 1, 2);
+    // d has left; b sits in seat 1 now, but only since the round.
     let err = commit(&mut w, &d, round, SERVICE).unwrap_err();
-    assert!(err.contains("NotActive"), "{err}");
-    commit(&mut w, &b, round, SERVICE).unwrap();
+    assert!(err.contains("ConstraintSeeds") || err.contains("NotActive"), "{err}");
+    let err = commit(&mut w, &b, round, SERVICE).unwrap_err();
+    assert!(err.contains("SatDownSince"), "{err}");
+    assert_eq!(drawn_for(&w.svm, round, SERVICE, None).0, None);
+    // For a round committed after the move, b reads.
+    let later = drawn_round(&mut w, &b, 50, 30_000);
+    commit(&mut w, &b, later, SERVICE).unwrap();
 }
 
 #[test]
@@ -314,7 +320,7 @@ fn a_membership_taken_after_the_round_opened_is_not_on_its_roster() {
     let r: Round = read(&w.svm, round);
     assert_eq!(r.members, 1);
     let err = commit(&mut w, &b, round, SERVICE).unwrap_err();
-    assert!(err.contains("NotSkippable"), "{err}");
+    assert!(err.contains("SatDownSince"), "{err}");
     commit(&mut w, &d, round, SERVICE).unwrap();
 }
 
@@ -392,4 +398,67 @@ fn a_reading_from_before_members_can_still_be_re_read() {
     let (c, _) = newcomer(&mut w.svm, 0);
     let err = try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), first), &c).unwrap_err();
     assert!(err.contains("NoMember") || err.contains("AccountNotInitialized"), "{err}");
+}
+
+#[test]
+fn a_membership_that_sat_down_after_the_round_does_not_read_for_it() {
+    // The attack the second review found: leave, rejoin into the last seat,
+    // and read whatever was drawn to it.
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let (b, _) = new_member(&mut w.svm);
+    let (c, _) = new_member(&mut w.svm);
+    let round = round_drawing_first(&mut w, &d, 3, 3);
+    // b leaves seat 2, so c moves up into it; then b joins again into seat 3.
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, b.pubkey(), 2), &b).unwrap();
+    assert_seat(&w.svm, 2, 3);
+    join(&mut w.svm, &b);
+    assert_seat(&w.svm, 3, 4);
+    let err = commit(&mut w, &b, round, SERVICE).unwrap_err();
+    assert!(err.contains("SatDownSince"), "{err}");
+
+    // The draw passes over both seats sat in since; the reader is whoever is
+    // left of those who were seated when the round was committed.
+    let (drawn, skipped) = drawn_for(&w.svm, round, SERVICE, None);
+    if let Some(k) = drawn {
+        assert_eq!(k, 1);
+        assert!(skipped.iter().all(|&s| s == 2 || s == 3), "{skipped:?}");
+        commit(&mut w, &d, round, SERVICE).unwrap();
+    }
+    let _ = c;
+}
+
+#[test]
+fn a_seat_sat_in_since_the_round_must_be_shown_to_be_passed_over() {
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let (b, _) = new_member(&mut w.svm);
+    let round = round_drawing_first(&mut w, &d, 2, 2);
+    // b leaves the last seat and rejoins: seat 2 is sat in since the round.
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, b.pubkey(), 2), &b).unwrap();
+    join(&mut w.svm, &b);
+    let q = sha256(&canonical_question(&[7u8; 16]));
+    let mut ix = commit_reading_ix(&w.svm, d.pubkey(), round, SERVICE, q);
+    let shown = ix.accounts.len() - 1;
+    assert_eq!(ix.accounts[shown].pubkey, seat_address(2));
+    ix.accounts.truncate(shown);
+    let err = try_ix(&mut w.svm, ix, &d).unwrap_err();
+    assert!(err.contains("NotSkippable"), "{err}");
+    commit(&mut w, &d, round, SERVICE).unwrap();
+}
+
+#[test]
+fn a_member_who_joined_in_the_rounds_own_slot_does_not_read_for_it() {
+    let mut w = world();
+    open(&mut w, 1_000 * DOLLAR);
+    let d = w.depositor.insecure_clone();
+    w.svm.warp_to_slot(1_000);
+    join(&mut w.svm, &d);
+    try_ix(&mut w.svm, open_round_ix(d.pubkey(), [1u8; 32], 10, 2, sha256(&[1u8; 32])), &d).unwrap();
+    at_slot(&mut w.svm, 1_040, &recent(1_040, &[]));
+    let round = round_address([1u8; 32]);
+    try_ix(&mut w.svm, reveal_ix(round, d.pubkey(), [1u8; 32]), &d).unwrap();
+    assert_eq!(seat(&w.svm, 1).since, 1_000);
+    let err = commit(&mut w, &d, round, SERVICE).unwrap_err();
+    assert!(err.contains("SatDownSince"), "{err}");
 }

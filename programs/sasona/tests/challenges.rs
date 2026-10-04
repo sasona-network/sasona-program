@@ -247,8 +247,9 @@ fn a_member_who_lost_their_stake_cannot_read_or_leave() {
     at_slot(&mut w.svm, slot + 40, &recent(slot + 40, &[]));
     try_ix(&mut w.svm, reveal_ix(round_address([2u8; 32]), d.pubkey(), [2u8; 32]), &d).unwrap();
     let q = sha256(&canonical_question(&[3u8; 16]));
+    // It has no seat to read from any more.
     let err = try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round_address([2u8; 32]), SERVICE, q), &d).unwrap_err();
-    assert!(err.contains("NotDrawn"), "{err}");
+    assert!(err.contains("ConstraintSeeds") || err.contains("NotDrawn"), "{err}");
 }
 
 #[test]

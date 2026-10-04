@@ -105,6 +105,9 @@ pub fn world_unverified() -> World {
 
 pub fn world_with(sigverify: bool) -> World {
     let mut svm = LiteSVM::new().with_sigverify(sigverify);
+    // The simulator's clock starts far ahead, and tests set slots in the
+    // thousands. A chain's slots only go forward, so start at the beginning.
+    svm.warp_to_slot(1);
     let so = std::env::var("SASONA_SO").expect("run through scripts/build.sh, which sets SASONA_SO");
     svm.add_program_from_file(program_id(), so).unwrap();
 
@@ -484,6 +487,7 @@ pub fn commit_reading_ix(svm: &LiteSVM, reader: Address, round: Address, endpoin
         round: key(round),
         members: key(members_address()),
         member: key(member),
+        seat: key(seat_of(svm, member)),
         reading: key(reading_address(round, endpoint)),
         system_program: anchor_lang::system_program::ID,
     }
@@ -523,6 +527,7 @@ pub fn commit_second_ix(svm: &LiteSVM, reader: Address, round: Address, endpoint
         round: key(round),
         members: key(members_address()),
         member: key(member),
+        seat: key(seat_of(svm, member)),
         reading: key(reading),
         first: key(first),
         pair: key(pda(&[sasona::PAIR_SEED, reading.as_ref()])),
@@ -697,7 +702,8 @@ pub fn drawn_for(svm: &LiteSVM, round: Address, endpoint: &str, first_reader: Op
         if k > now {
             continue;
         }
-        if Some(addr(seat(svm, k).owner)) == first_reader {
+        let s = seat(svm, k);
+        if s.since >= r.commit_slot || Some(addr(s.owner)) == first_reader {
             skipped.push(k);
             continue;
         }
@@ -714,7 +720,8 @@ fn reader_accounts(svm: &LiteSVM, reader: Address, round: Address, endpoint: &st
             return (member_address(s.member), skipped.into_iter().map(seat_address).collect());
         }
     }
-    let own = (1..=member_count(svm)).find(|&n| addr(member(svm, n).owner) == reader);
+    let owned: Vec<u32> = (1..=member_count(svm)).filter(|&n| addr(member(svm, n).owner) == reader).collect();
+    let own = owned.iter().copied().find(|&n| member(svm, n).seat > 0).or(owned.first().copied());
     (member_address(own.unwrap_or(1)), vec![])
 }
 
@@ -813,4 +820,15 @@ pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
         accounts.extend(unseat_accounts(svm, r.member));
     }
     Instruction { program_id: program_id(), accounts, data: sasona::instruction::UpholdChallenge {}.data() }
+}
+
+/// The seat a membership account sits in, or seat 1's address if it has none
+/// or does not exist, so the program is what refuses it.
+pub fn seat_of(svm: &LiteSVM, member: Address) -> Address {
+    let k = svm
+        .get_account(&member)
+        .and_then(|a| sasona::Member::try_deserialize(&mut a.data.as_slice()).ok())
+        .map(|m| m.seat)
+        .unwrap_or(0);
+    seat_address(k.max(1))
 }

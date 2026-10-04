@@ -262,7 +262,7 @@ fn the_service_must_be_a_clean_url_matching_its_hash() {
     // The hash that places the reading must be the hash of the service named.
     let other = "https://other.example/x";
     let mut ix = commit_reading_ix(&w.svm, d.pubkey(), round, SERVICE, q);
-    ix.accounts[4].pubkey = reading_address(round, other);
+    ix.accounts[5].pubkey = reading_address(round, other);
     ix.data = anchor_lang::InstructionData::data(&sasona::instruction::CommitReading {
         endpoint_hash: sha256(other.as_bytes()),
         endpoint: SERVICE.to_string(),
