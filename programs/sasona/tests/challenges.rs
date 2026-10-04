@@ -4,8 +4,8 @@
 mod common;
 use common::*;
 use sasona::{
-    canonical_question, verdict_of, Challenge, Reading, ANSWER_WINDOW_SLOTS, CHALLENGE_ANSWERED, CHALLENGE_BOND_LAMPORTS,
-    CHALLENGE_UPHELD, MAX_REPLY_BYTES, MEMBER_LEFT, MEMBER_SLASHED, MEMBER_STAKE, READING_FALSE, READING_REVEALED,
+    canonical_question, verdict_of, Challenge, Reading, ANSWER_WINDOW_SECONDS, CHALLENGE_ANSWERED, CHALLENGE_BOND_LAMPORTS, CHALLENGE_WINDOW_SECONDS,
+    CHALLENGE_UPHELD, MAX_REPLY_BYTES, MEMBER_SLASHED, MEMBER_STAKE, READING_FALSE, READING_REVEALED,
 };
 
 const SERVICE: &str = "https://sandbox.example.net/run/python";
@@ -17,6 +17,12 @@ const CANNED: &[u8] = b"{\"status\":\"ok\",\"output\":\"done\"}";
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+}
+
+fn seconds_pass(svm: &mut LiteSVM, seconds: i64) {
+    let mut c: solana_clock::Clock = svm.get_sysvar();
+    c.unix_timestamp += seconds;
+    svm.set_sysvar(&c);
 }
 
 fn lamports(svm: &LiteSVM, at: Address) -> u64 {
@@ -80,7 +86,8 @@ fn a_challenge_answered_with_the_reply_pays_the_member() {
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
     let ch: Challenge = read(&w.svm, challenge_address(reading));
-    assert_eq!((addr(ch.challenger), ch.deadline_slot), (c.pubkey(), 1_101 + ANSWER_WINDOW_SLOTS));
+    let now = w.svm.get_sysvar::<solana_clock::Clock>().unix_timestamp;
+    assert_eq!((addr(ch.challenger), ch.deadline), (c.pubkey(), now + ANSWER_WINDOW_SECONDS));
     assert_eq!(member(&w.svm, 1).open_challenges, 1);
 
     put_evidence(&mut w.svm, &d, reading, ANSWER).unwrap();
@@ -97,7 +104,7 @@ fn a_challenge_answered_with_the_reply_pays_the_member() {
 
     let err = try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap_err();
     assert!(err.contains("ChallengeClosed"), "{err}");
-    w.svm.warp_to_slot(1_101 + ANSWER_WINDOW_SLOTS + 1);
+    days_pass(&mut w.svm, 8);
     let err = try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap_err();
     assert!(err.contains("ChallengeClosed"), "{err}");
 }
@@ -185,9 +192,9 @@ fn an_answer_after_the_deadline_is_refused() {
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
     put_evidence(&mut w.svm, &d, reading, ANSWER).unwrap();
-    w.svm.warp_to_slot(1_101 + ANSWER_WINDOW_SLOTS + 1);
+    days_pass(&mut w.svm, 8);
     let err = try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap_err();
-    assert!(err.contains("TooLate"), "{err}");
+    assert!(err.contains("WindowClosed"), "{err}");
 }
 
 #[test]
@@ -196,11 +203,11 @@ fn an_unanswered_challenge_takes_the_stake() {
     let reading = revealed(&mut w, CANNED, 1);
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
-    w.svm.warp_to_slot(1_101 + ANSWER_WINDOW_SLOTS);
+    seconds_pass(&mut w.svm, ANSWER_WINDOW_SECONDS);
     let err = try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap_err();
     assert!(err.contains("NotLapsedYet"), "{err}");
 
-    w.svm.warp_to_slot(1_101 + ANSWER_WINDOW_SLOTS + 1);
+    seconds_pass(&mut w.svm, 1);
     let (anyone, _) = newcomer(&mut w.svm, 0);
     let coins_before = coins(&w.svm, c.pubkey());
     let sol_before = lamports(&w.svm, c.pubkey());
@@ -226,15 +233,15 @@ fn a_member_who_lost_their_stake_cannot_read_or_leave() {
     let reading = revealed(&mut w, CANNED, 1);
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
-    w.svm.warp_to_slot(1_101 + ANSWER_WINDOW_SLOTS + 1);
+    days_pass(&mut w.svm, 8);
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
 
-    let err = try_ix(&mut w.svm, ask_to_leave_ix(d.pubkey(), 1), &d).unwrap_err();
+    let err = try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap_err();
     assert!(err.contains("NotActive"), "{err}");
     let err = try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap_err();
     assert!(err.contains("NotLeaving"), "{err}");
 
-    let slot = 1_101 + ANSWER_WINDOW_SLOTS + 10;
+    let slot = 2_000;
     w.svm.warp_to_slot(slot);
     try_ix(&mut w.svm, open_round_ix(d.pubkey(), [2u8; 32], 10, 2, sha256(&[2u8; 32])), &d).unwrap();
     at_slot(&mut w.svm, slot + 40, &recent(slot + 40, &[]));
@@ -250,8 +257,8 @@ fn a_false_reading_cannot_be_re_tested() {
     let reading = revealed(&mut w, CANNED, 1);
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
-    let slot = 1_101 + ANSWER_WINDOW_SLOTS + 1;
-    w.svm.warp_to_slot(slot);
+    let slot = 2_000;
+    days_pass(&mut w.svm, 8);
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
 
     let (b, _) = new_member(&mut w.svm);
@@ -266,39 +273,138 @@ fn a_false_reading_cannot_be_re_tested() {
 }
 
 #[test]
-fn a_member_with_an_open_challenge_cannot_leave() {
+fn a_member_answers_within_their_notice_and_then_leaves() {
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let reading = revealed(&mut w, ANSWER, 1);
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
+    days_pass(&mut w.svm, 29);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+    days_pass(&mut w.svm, 6);
+    put_evidence(&mut w.svm, &d, reading, ANSWER).unwrap();
+    try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap();
+    days_pass(&mut w.svm, 10);
+    try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap();
+}
+
+#[test]
+fn a_challenge_nobody_has_upheld_yet_still_holds_the_stake() {
+    // The answer's time ran out, but nobody has upheld it: the member still
+    // cannot take the stake and run.
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let reading = revealed(&mut w, CANNED, 1);
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
+    days_pass(&mut w.svm, 46);
+    let err = try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap_err();
+    assert!(err.contains("ChallengeOpen"), "{err}");
+    let coins_before = coins(&w.svm, c.pubkey());
+    try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    assert_eq!(coins(&w.svm, c.pubkey()), coins_before + MEMBER_STAKE / 10);
+    assert_eq!(member(&w.svm, 1).state, MEMBER_SLASHED);
+    let err = try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap_err();
+    assert!(err.contains("NotLeaving"), "{err}");
+}
+
+#[test]
+fn a_reading_can_be_challenged_for_thirty_days() {
+    let mut w = world_with_member();
+    let reading = revealed(&mut w, ANSWER, 1);
+    let c = challenger(&mut w.svm);
+    seconds_pass(&mut w.svm, CHALLENGE_WINDOW_SECONDS + 1);
+    let err = try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap_err();
+    assert!(err.contains("WindowClosed"), "{err}");
+}
+
+#[test]
+fn a_reading_can_be_challenged_on_its_thirtieth_day() {
+    let mut w = world_with_member();
+    let reading = revealed(&mut w, ANSWER, 1);
+    let c = challenger(&mut w.svm);
+    seconds_pass(&mut w.svm, CHALLENGE_WINDOW_SECONDS);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+}
+
+#[test]
+fn an_answered_reply_can_no_longer_change() {
     let mut w = world_with_member();
     let d = w.depositor.insecure_clone();
     let reading = revealed(&mut w, ANSWER, 1);
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
-    try_ix(&mut w.svm, ask_to_leave_ix(d.pubkey(), 1), &d).unwrap();
-    days_pass(&mut w.svm, 46);
-    let err = try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap_err();
-    assert!(err.contains("ChallengeOpen"), "{err}");
     put_evidence(&mut w.svm, &d, reading, ANSWER).unwrap();
+    try_ix(&mut w.svm, write_evidence_ix(d.pubkey(), reading, 0, b"x"), &d).unwrap();
+    let err = try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap_err();
+    assert!(err.contains("NotTheReply"), "{err}");
+    try_ix(&mut w.svm, write_evidence_ix(d.pubkey(), reading, 0, b"3"), &d).unwrap();
     try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap();
-    try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap();
+    let err = try_ix(&mut w.svm, write_evidence_ix(d.pubkey(), reading, 0, b"x"), &d).unwrap_err();
+    assert!(err.contains("EvidenceSealed"), "{err}");
+    let e: sasona::Evidence = read(&w.svm, evidence_address(reading));
+    assert_eq!((e.sealed, e.reply.as_slice()), (true, ANSWER));
 }
 
 #[test]
-fn a_reading_challenged_after_its_member_left_still_stops_counting() {
+fn a_member_who_asked_to_leave_still_loses_the_stake() {
     let mut w = world_with_member();
     let d = w.depositor.insecure_clone();
     let reading = revealed(&mut w, CANNED, 1);
-    try_ix(&mut w.svm, ask_to_leave_ix(d.pubkey(), 1), &d).unwrap();
-    days_pass(&mut w.svm, 45);
-    try_ix(&mut w.svm, leave_ix(d.pubkey(), 1), &d).unwrap();
-
     let c = challenger(&mut w.svm);
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
-    w.svm.warp_to_slot(w.svm.get_sysvar::<solana_clock::Clock>().slot + ANSWER_WINDOW_SLOTS + 1);
-    let coins_before = coins(&w.svm, c.pubkey());
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
+    days_pass(&mut w.svm, 8);
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), MEMBER_STAKE - MEMBER_STAKE / 10);
+    let m = member(&w.svm, 1);
+    assert_eq!((m.state, m.stake, m.seat), (MEMBER_SLASHED, 0, 0));
+}
+
+#[test]
+fn a_member_who_lost_their_seat_hands_it_to_the_last() {
+    let mut w = world_with_member();
+    let reading = revealed(&mut w, CANNED, 1);
+    let (b, _) = new_member(&mut w.svm);
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+    days_pass(&mut w.svm, 8);
+    try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    assert_eq!(seated(&w.svm), 1);
+    let s1 = seat(&w.svm, 1);
+    assert_eq!((s1.member, addr(s1.owner)), (2, b.pubkey()));
+    assert_eq!(member(&w.svm, 2).seat, 1);
+    // Only the stake taken left the vault; b's is still there.
+    assert_eq!(token_balance(&w.svm, pda(&[sasona::STAKES_SEED])), MEMBER_STAKE);
+}
+
+#[test]
+fn a_second_upheld_challenge_finds_no_stake_left() {
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let one = revealed(&mut w, CANNED, 1);
+    let round = round_address([1u8; 32]);
+    let other_service = "https://data.example.com/prices";
+    let q = sha256(&canonical_question(&[5u8; 16]));
+    try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, other_service, q), &d).unwrap();
+    let two = reading_address(round, other_service);
+    w.svm.warp_to_slot(1_102);
+    try_ix(&mut w.svm, reveal_reading_ix(d.pubkey(), two, [5u8; 16], sha256(CANNED), 1), &d).unwrap();
+
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), one), &c).unwrap();
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), two), &c).unwrap();
+    assert_eq!(member(&w.svm, 1).open_challenges, 2);
+    days_pass(&mut w.svm, 8);
+    try_with(&mut w.svm, |s| uphold_ix(s, one), &c).unwrap();
+    let coins_before = coins(&w.svm, c.pubkey());
+    try_with(&mut w.svm, |s| uphold_ix(s, two), &c).unwrap();
     assert_eq!(coins(&w.svm, c.pubkey()), coins_before);
-    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), 0);
-    assert_eq!(member(&w.svm, 1).state, MEMBER_LEFT);
-    let r: Reading = read(&w.svm, reading);
+    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), MEMBER_STAKE - MEMBER_STAKE / 10);
+    let m = member(&w.svm, 1);
+    assert_eq!((m.state, m.open_challenges), (MEMBER_SLASHED, 0));
+    let r: Reading = read(&w.svm, two);
     assert_eq!(r.state, READING_FALSE);
 }
 
@@ -347,4 +453,29 @@ fn the_answer_cannot_borrow_another_readings_nonce() {
     let err = try_with(&mut w.svm, |s| answer_ix(s, reading, [5u8; 16]), &c).unwrap_err();
     assert!(err.contains("NonceTaken"), "{err}");
     try_with(&mut w.svm, |s| answer_ix(s, reading, NONCE), &c).unwrap();
+}
+
+#[test]
+fn a_pair_whose_first_reading_was_upheld_false_does_not_settle() {
+    let mut w = world_with_member();
+    let first = revealed(&mut w, CANNED, 1);
+    let (b, _) = new_member(&mut w.svm);
+    w.svm.warp_to_slot(1_200);
+    let seed = [2u8; 32];
+    try_ix(&mut w.svm, open_round_ix(b.pubkey(), [2u8; 32], 10, 2, sha256(&seed)), &b).unwrap();
+    at_slot(&mut w.svm, 1_240, &recent(1_240, &[]));
+    let reread = round_address([2u8; 32]);
+    try_ix(&mut w.svm, reveal_ix(reread, b.pubkey(), seed), &b).unwrap();
+    let q = sha256(&canonical_question(&[6u8; 16]));
+    try_with(&mut w.svm, |s| commit_second_ix(s, b.pubkey(), reread, SERVICE, q, first), &b).unwrap();
+    let second = reading_address(reread, SERVICE);
+    w.svm.warp_to_slot(1_241);
+    try_ix(&mut w.svm, reveal_reading_ix(b.pubkey(), second, [6u8; 16], [9u8; 32], 2), &b).unwrap();
+
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), first), &c).unwrap();
+    days_pass(&mut w.svm, 8);
+    try_with(&mut w.svm, |s| uphold_ix(s, first), &c).unwrap();
+    let err = try_ix(&mut w.svm, settle_pair_ix(first, second), &c).unwrap_err();
+    assert!(err.contains("FirstNotRevealed"), "{err}");
 }

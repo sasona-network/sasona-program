@@ -179,7 +179,7 @@ fn a_pair_settles_only_against_the_first_it_named() {
     let (third, _) = new_member(&mut w.svm);
     // The second reader steps away, so the draw for the later round can only
     // land on the third: the first reader is passed over in a second reading.
-    try_ix(&mut w.svm, ask_to_leave_ix(other.pubkey(), 2), &other).unwrap();
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, other.pubkey(), 2), &other).unwrap();
     let later = drawn_round(&mut w, &third, 3, 1_300);
     try_with(&mut w.svm, |s| commit_second_ix(s, third.pubkey(), later, SERVICE, sha256(&canonical_question(&nonce(3))), first), &third).unwrap();
     let decoy = reading_address(later, SERVICE);

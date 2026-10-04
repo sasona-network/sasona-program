@@ -151,6 +151,7 @@ pub const PAIR_AGREED_FAILS: u8 = 3;
 /// MEMBER_STAKE coins, numbered from 1 in the order taken.
 pub const MEMBERS_SEED: &[u8] = b"members";
 pub const MEMBER_SEED: &[u8] = b"member";
+pub const SEAT_SEED: &[u8] = b"seat";
 pub const STAKES_SEED: &[u8] = b"stakes";
 /// NOTE, temporary: one flat stake, 10,000 coins, about two devnet dollars.
 /// A stake that deters has to grow with the traffic a service carries, which
@@ -160,8 +161,11 @@ pub const MEMBER_ACTIVE: u8 = 0;
 pub const MEMBER_LEAVING: u8 = 1;
 pub const MEMBER_LEFT: u8 = 2;
 pub const MEMBER_SLASHED: u8 = 3;
-/// SPEC.md 4.3: how many memberships are tried before a service goes unread.
+/// SPEC.md 4.3: how many seats are tried before a service goes unread.
 pub const MAX_READER_ATTEMPTS: u32 = 16;
+/// SPEC.md 4.3: a reading is committed within this many slots of the slot
+/// the round's entropy came from, about an hour.
+pub const READ_WINDOW_SLOTS: u64 = 9_000;
 
 /// Challenges (SPEC.md section 5).
 pub const CHALLENGE_SEED: &[u8] = b"challenge";
@@ -170,9 +174,15 @@ pub const EVIDENCE_SEED: &[u8] = b"evidence";
 /// NOTE, temporary: nothing can take them out until chargebacks are on chain
 /// (part 7), which decides where they go.
 pub const HELD_SEED: &[u8] = b"held";
+/// NOTE, temporary: the bond and the challenger's tenth are devnet figures,
+/// set with the stake from what readings are worth once prices are on chain
+/// (part 6).
 pub const CHALLENGE_BOND_LAMPORTS: u64 = 100_000_000;
-/// About a day.
-pub const ANSWER_WINDOW_SLOTS: u64 = 216_000;
+/// SPEC.md 5.1: a reading can be challenged for 30 days after its reveal, the
+/// term a reading is current for, and a challenge answered for 7 days. Both
+/// end inside the 45 days' notice a member gives to leave.
+pub const CHALLENGE_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub const ANSWER_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 /// The largest reply a member can put on chain in answer. An account created
 /// by the program is at most 10,240 bytes.
 pub const MAX_REPLY_BYTES: u32 = 10_000;
@@ -488,7 +498,7 @@ pub mod sasona {
         r.state = ROUND_COMMITTED;
         r.bump = ctx.bumps.round;
         // SPEC.md 4.2: the roster is the memberships taken before now.
-        r.members = ctx.accounts.members.count;
+        r.members = ctx.accounts.members.seated;
         ctx.accounts.members.bump = ctx.bumps.members;
         emit!(RoundOpened { round: r.key(), opener: r.opener, pool_fingerprint, pool_size, count, commit_slot: r.commit_slot });
         Ok(())
@@ -544,9 +554,9 @@ pub mod sasona {
     /// Commit to the question for one service of a drawn round, before
     /// calling it.
     ///
-    /// Only the member drawn for the service may (SPEC.md 4.3). The
-    /// memberships drawn before theirs and passed over come in the remaining
-    /// accounts, in order, so the program can see each was not active.
+    /// Only the member drawn for the service may (SPEC.md 4.3), within about
+    /// an hour of the draw. The seats drawn before theirs and passed over come
+    /// in the remaining accounts, in order, so the program can check each.
     /// Whether the service is one of the round's picks is checked off chain,
     /// against the published list.
     pub fn commit_reading<'info>(
@@ -555,7 +565,8 @@ pub mod sasona {
         endpoint: String,
         question_hash: [u8; 32],
     ) -> Result<()> {
-        check_drawn(&ctx.accounts.round, &endpoint_hash, &ctx.accounts.member, ctx.accounts.reader.key(), ctx.remaining_accounts, None)?;
+        let a = &ctx.accounts;
+        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, a.reader.key(), ctx.remaining_accounts, None)?;
         let a = &mut *ctx.accounts;
         start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)?;
         a.reading.member = a.member.number;
@@ -600,6 +611,7 @@ pub mod sasona {
         r.reply_hash = reply_hash;
         r.verdict = verdict;
         r.reveal_slot = now;
+        r.reveal_time = Clock::get()?.unix_timestamp;
         r.state = READING_REVEALED;
         emit!(ReadingRevealed { reading: r.key(), reply_hash, verdict, reveal_slot: now });
         Ok(())
@@ -629,7 +641,8 @@ pub mod sasona {
         require!(first.reveal_slot < ctx.accounts.round.commit_slot, SasonaError::TooEarly);
         let first_key = first.key();
         let first_reader = first.reader;
-        check_drawn(&ctx.accounts.round, &endpoint_hash, &ctx.accounts.member, ctx.accounts.reader.key(), ctx.remaining_accounts, Some(first_reader))?;
+        let a = &ctx.accounts;
+        check_drawn(&a.round, &a.members, &endpoint_hash, &a.member, a.reader.key(), ctx.remaining_accounts, Some(first_reader))?;
 
         let a = &mut *ctx.accounts;
         start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)?;
@@ -647,6 +660,8 @@ pub mod sasona {
     pub fn settle_pair(ctx: Context<SettlePair>) -> Result<()> {
         let second = &ctx.accounts.second;
         require!(second.state == READING_REVEALED, SasonaError::ReadingNotOpen);
+        // A first reading upheld false since no longer counts (SPEC.md 5.3).
+        require!(ctx.accounts.first.state == READING_REVEALED, SasonaError::FirstNotRevealed);
         let p = &mut ctx.accounts.pair;
         require!(p.outcome == 0, SasonaError::AlreadySettled);
         p.outcome = pair_outcome(ctx.accounts.first.verdict, second.verdict);
@@ -665,7 +680,7 @@ pub mod sasona {
     }
 
     /// Take a membership: lock one stake of coin (SPEC.md 4.1). The
-    /// membership gets the next number, and is active at once.
+    /// membership gets the next number and sits in the seat after the last.
     pub fn join_members(ctx: Context<JoinMembers>) -> Result<()> {
         let a = &ctx.accounts;
         token::transfer(
@@ -682,24 +697,33 @@ pub mod sasona {
         let members = &mut ctx.accounts.members;
         members.bump = ctx.bumps.members;
         members.count = members.count.checked_add(1).ok_or(SasonaError::Overflow)?;
-        let number = members.count;
+        members.seated = members.seated.checked_add(1).ok_or(SasonaError::Overflow)?;
+        let (number, seat) = (members.count, members.seated);
+        let owner = ctx.accounts.owner.key();
         let m = &mut ctx.accounts.member;
-        m.owner = ctx.accounts.owner.key();
+        m.owner = owner;
         m.number = number;
+        m.seat = seat;
         m.state = MEMBER_ACTIVE;
         m.stake = MEMBER_STAKE;
         m.leave_at = 0;
         m.open_challenges = 0;
         m.bump = ctx.bumps.member;
-        emit!(MemberJoined { owner: m.owner, number, stake: MEMBER_STAKE });
+        let s = &mut ctx.accounts.seat;
+        s.member = number;
+        s.owner = owner;
+        s.bump = ctx.bumps.seat;
+        emit!(MemberJoined { owner, number, seat, stake: MEMBER_STAKE });
         Ok(())
     }
 
-    /// Ask to leave. The membership stops being active now; its stake comes
-    /// back after the notice (SPEC.md 4.4).
-    pub fn ask_to_leave(ctx: Context<AskToLeave>) -> Result<()> {
+    /// Ask to leave. The membership leaves its seat now; its stake comes back
+    /// after the notice (SPEC.md 4.4). The remaining accounts are its seat,
+    /// then, unless it sat last, the last seat and the membership in it.
+    pub fn ask_to_leave<'info>(ctx: Context<'info, AskToLeave<'info>>) -> Result<()> {
+        require!(ctx.accounts.member.state == MEMBER_ACTIVE, SasonaError::NotActive);
+        unseat(&mut ctx.accounts.members, &mut ctx.accounts.member, ctx.remaining_accounts)?;
         let m = &mut ctx.accounts.member;
-        require!(m.state == MEMBER_ACTIVE, SasonaError::NotActive);
         m.state = MEMBER_LEAVING;
         m.leave_at = Clock::get()?.unix_timestamp.checked_add(NOTICE_SECONDS).ok_or(SasonaError::Overflow)?;
         emit!(MemberLeaving { number: m.number, leave_at: m.leave_at });
@@ -734,13 +758,16 @@ pub mod sasona {
         Ok(())
     }
 
-    /// Challenge a revealed reading taken by a member: they have about a day
-    /// to put the nonce and the reply on chain (SPEC.md 5.1). A reading can be
-    /// challenged once. The bond goes to the member if they answer.
+    /// Challenge a reading taken by a member, within 30 days of its reveal:
+    /// they have 7 days to put the nonce and the reply on chain (SPEC.md 5.1).
+    /// A reading can be challenged once. The bond goes to the member if they
+    /// answer.
     pub fn challenge(ctx: Context<ChallengeReading>) -> Result<()> {
         let r = &ctx.accounts.reading;
         require!(r.state == READING_REVEALED, SasonaError::ReadingNotOpen);
         require!(r.member > 0, SasonaError::NoMember);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= r.reveal_time.checked_add(CHALLENGE_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?, SasonaError::WindowClosed);
         anchor_lang::system_program::transfer(
             CpiContext::new(
                 ctx.accounts.system_program.key(),
@@ -751,16 +778,16 @@ pub mod sasona {
             ),
             CHALLENGE_BOND_LAMPORTS,
         )?;
-        let deadline_slot = Clock::get()?.slot.checked_add(ANSWER_WINDOW_SLOTS).ok_or(SasonaError::Overflow)?;
+        let deadline = now.checked_add(ANSWER_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;
         let c = &mut ctx.accounts.challenge;
         c.reading = r.key();
         c.challenger = ctx.accounts.challenger.key();
-        c.deadline_slot = deadline_slot;
+        c.deadline = deadline;
         c.state = CHALLENGE_OPEN;
         c.bump = ctx.bumps.challenge;
         let m = &mut ctx.accounts.member;
         m.open_challenges = m.open_challenges.checked_add(1).ok_or(SasonaError::Overflow)?;
-        emit!(Challenged { reading: c.reading, challenger: c.challenger, deadline_slot });
+        emit!(Challenged { reading: c.reading, challenger: c.challenger, deadline });
         Ok(())
     }
 
@@ -770,13 +797,15 @@ pub mod sasona {
         require!(len <= MAX_REPLY_BYTES, SasonaError::ReplyTooLong);
         let e = &mut ctx.accounts.evidence;
         e.reading = ctx.accounts.reading.key();
+        e.sealed = false;
         e.reply = vec![0u8; len as usize];
         Ok(())
     }
 
-    /// Write part of the reply, from `offset`.
+    /// Write part of the reply, from `offset`, until an answer seals it.
     pub fn write_evidence(ctx: Context<WriteEvidence>, offset: u32, bytes: Vec<u8>) -> Result<()> {
         let e = &mut ctx.accounts.evidence;
+        require!(!e.sealed, SasonaError::EvidenceSealed);
         let start = offset as usize;
         let end = start.checked_add(bytes.len()).ok_or(SasonaError::Overflow)?;
         require!(end <= e.reply.len(), SasonaError::ReplyTooLong);
@@ -785,11 +814,12 @@ pub mod sasona {
     }
 
     /// Answer a challenge with the nonce, against the reply already written
-    /// (SPEC.md 5.2). Anyone may send it; it holds or it does not.
+    /// (SPEC.md 5.2). Anyone may send it; it holds or it does not. Once it
+    /// holds, the reply on chain can no longer be changed.
     pub fn answer_challenge(ctx: Context<AnswerChallenge>, nonce: [u8; 16]) -> Result<()> {
         let c = &ctx.accounts.challenge;
         require!(c.state == CHALLENGE_OPEN, SasonaError::ChallengeClosed);
-        require!(Clock::get()?.slot <= c.deadline_slot, SasonaError::TooLate);
+        require!(Clock::get()?.unix_timestamp <= c.deadline, SasonaError::WindowClosed);
         let r = &ctx.accounts.reading;
         require_keys_eq!(ctx.accounts.used_nonce.reading, r.key(), SasonaError::NonceTaken);
         let reply = &ctx.accounts.evidence.reply;
@@ -800,6 +830,7 @@ pub mod sasona {
         **challenge_info.try_borrow_mut_lamports()? -= CHALLENGE_BOND_LAMPORTS;
         **ctx.accounts.reader.to_account_info().try_borrow_mut_lamports()? += CHALLENGE_BOND_LAMPORTS;
         ctx.accounts.challenge.state = CHALLENGE_ANSWERED;
+        ctx.accounts.evidence.sealed = true;
         let m = &mut ctx.accounts.member;
         m.open_challenges -= 1;
         emit!(ChallengeAnswered { reading: ctx.accounts.reading.key() });
@@ -808,14 +839,16 @@ pub mod sasona {
 
     /// Uphold a challenge nobody answered in time (SPEC.md 5.3). The reading
     /// stops counting. If the membership still has its stake, it loses all of
-    /// it: a tenth to the challenger, the rest held. Anyone may send it.
-    pub fn uphold_challenge(ctx: Context<UpholdChallenge>) -> Result<()> {
+    /// it, a tenth to the challenger and the rest held, and its seat if it
+    /// has one: then the remaining accounts are as for ask_to_leave. Anyone
+    /// may send it.
+    pub fn uphold_challenge<'info>(ctx: Context<'info, UpholdChallenge<'info>>) -> Result<()> {
         let c = &ctx.accounts.challenge;
         require!(c.state == CHALLENGE_OPEN, SasonaError::ChallengeClosed);
-        require!(Clock::get()?.slot > c.deadline_slot, SasonaError::NotLapsedYet);
+        require!(Clock::get()?.unix_timestamp > c.deadline, SasonaError::NotLapsedYet);
 
-        let m = &ctx.accounts.member;
-        let stake = if m.state == MEMBER_ACTIVE || m.state == MEMBER_LEAVING { m.stake } else { 0 };
+        let state = ctx.accounts.member.state;
+        let stake = if state == MEMBER_ACTIVE || state == MEMBER_LEAVING { ctx.accounts.member.stake } else { 0 };
         let reward = stake / 10;
         if stake > 0 {
             let bump = [ctx.accounts.pool.bump];
@@ -832,6 +865,9 @@ pub mod sasona {
                     amount,
                 )?;
             }
+        }
+        if state == MEMBER_ACTIVE {
+            unseat(&mut ctx.accounts.members, &mut ctx.accounts.member, ctx.remaining_accounts)?;
         }
 
         let challenge_info = ctx.accounts.challenge.to_account_info();
@@ -1095,11 +1131,68 @@ pub fn reader_number(final_seed: &[u8; 32], endpoint_hash: &[u8; 32], attempt: u
     1 + acc as u32
 }
 
-/// Refuse unless `member`, held by `reader`, is the membership drawn for this
-/// service. `skipped` are the memberships drawn before it, in order, each of
-/// which must not qualify: not active, or held by the first reading's reader.
+/// Load a Seat from an account the caller passed, checking it is the seat
+/// numbered `k`.
+fn seat_at(info: &AccountInfo, k: u32) -> Result<Seat> {
+    require_keys_eq!(*info.owner, crate::ID, SasonaError::NotTheSeat);
+    let s = Seat::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+    let at = Pubkey::create_program_address(&[SEAT_SEED, &k.to_le_bytes(), &[s.bump]], &crate::ID)
+        .map_err(|_| SasonaError::NotTheSeat)?;
+    require_keys_eq!(info.key(), at, SasonaError::NotTheSeat);
+    Ok(s)
+}
+
+fn store<T: AccountSerialize>(info: &AccountInfo, value: &T) -> Result<()> {
+    let mut data = info.try_borrow_mut_data()?;
+    let mut out: &mut [u8] = &mut data[..];
+    value.try_serialize(&mut out)
+}
+
+/// Take `member` off the roster (SPEC.md 4.2). `accounts` are its seat, then,
+/// unless it is the last seat, the last seat and the membership sitting in
+/// it, which moves into the freed seat.
+fn unseat(members: &mut Members, member: &mut Member, accounts: &[AccountInfo]) -> Result<()> {
+    let (k, last) = (member.seat, members.seated);
+    require!(k > 0 && k <= last, SasonaError::NotTheSeat);
+    let seat_info = accounts.first().ok_or(SasonaError::NotTheSeat)?;
+    let mut seat = seat_at(seat_info, k)?;
+    require!(seat.member == member.number, SasonaError::NotTheSeat);
+    if k == last {
+        seat.member = 0;
+        seat.owner = Pubkey::default();
+    } else {
+        let (last_info, mover_info) = match accounts {
+            [_, l, m, ..] => (l, m),
+            _ => return err!(SasonaError::NotTheSeat),
+        };
+        let mut last_seat = seat_at(last_info, last)?;
+        require_keys_eq!(*mover_info.owner, crate::ID, SasonaError::NotTheSeat);
+        let mut mover = Member::try_deserialize(&mut &mover_info.try_borrow_data()?[..])?;
+        let at = Pubkey::create_program_address(&[MEMBER_SEED, &mover.number.to_le_bytes(), &[mover.bump]], &crate::ID)
+            .map_err(|_| SasonaError::NotTheSeat)?;
+        require_keys_eq!(mover_info.key(), at, SasonaError::NotTheSeat);
+        require!(mover.number == last_seat.member && mover.seat == last, SasonaError::NotTheSeat);
+        seat.member = last_seat.member;
+        seat.owner = last_seat.owner;
+        mover.seat = k;
+        last_seat.member = 0;
+        last_seat.owner = Pubkey::default();
+        store(last_info, &last_seat)?;
+        store(mover_info, &mover)?;
+    }
+    store(seat_info, &seat)?;
+    member.seat = 0;
+    members.seated = last - 1;
+    Ok(())
+}
+
+/// Refuse unless `member`, held by `reader`, sits in the seat drawn for this
+/// service now (SPEC.md 4.3), and the round's window to read is open. Seats
+/// drawn before it that exist now come in `skipped`, in order: each must
+/// hold the first reading's reader, the only reason to pass one over.
 fn check_drawn(
     round: &Round,
+    members: &Members,
     endpoint_hash: &[u8; 32],
     member: &Member,
     reader: Pubkey,
@@ -1107,25 +1200,24 @@ fn check_drawn(
     first_reader: Option<Pubkey>,
 ) -> Result<()> {
     require!(round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
+    require!(Clock::get()?.slot <= round.entropy_slot + READ_WINDOW_SLOTS, SasonaError::WindowClosed);
     require!(round.members > 0, SasonaError::NotDrawn);
     require_keys_eq!(member.owner, reader, SasonaError::NotTheReader);
-    let qualifies = |m: &Member| m.state == MEMBER_ACTIVE && Some(m.owner) != first_reader;
+    require!(member.state == MEMBER_ACTIVE && member.seat > 0, SasonaError::NotActive);
+    let mut shown = 0usize;
     for attempt in 0..MAX_READER_ATTEMPTS {
         let k = reader_number(&round.final_seed, endpoint_hash, attempt, round.members);
-        match skipped.get(attempt as usize) {
-            Some(info) => {
-                require_keys_eq!(*info.owner, crate::ID, SasonaError::NotDrawn);
-                let m = Member::try_deserialize(&mut &info.try_borrow_data()?[..])?;
-                let at = Pubkey::create_program_address(&[MEMBER_SEED, &k.to_le_bytes(), &[m.bump]], &crate::ID)
-                    .map_err(|_| SasonaError::NotDrawn)?;
-                require_keys_eq!(info.key(), at, SasonaError::NotDrawn);
-                require!(!qualifies(&m), SasonaError::NotSkippable);
-            }
-            None => {
-                require!(member.number == k && qualifies(member), SasonaError::NotDrawn);
-                return Ok(());
-            }
+        if k > members.seated {
+            continue;
         }
+        if k == member.seat {
+            require!(shown == skipped.len(), SasonaError::NotDrawn);
+            return Ok(());
+        }
+        let info = skipped.get(shown).ok_or(SasonaError::NotSkippable)?;
+        shown += 1;
+        let s = seat_at(info, k)?;
+        require!(Some(s.owner) == first_reader, SasonaError::NotSkippable);
     }
     err!(SasonaError::NotDrawn)
 }
@@ -1538,6 +1630,9 @@ pub struct CommitReading<'info> {
     #[account(seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
     pub round: Account<'info, Round>,
 
+    #[account(seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
+
     /// The reader's membership, the one drawn for this service.
     #[account(seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump)]
     pub member: Account<'info, Member>,
@@ -1576,6 +1671,9 @@ pub struct CommitSecondReading<'info> {
     /// The re-read round.
     #[account(seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
     pub round: Account<'info, Round>,
+
+    #[account(seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
 
     /// The reader's membership, the one drawn for this service.
     #[account(seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump)]
@@ -1753,6 +1851,12 @@ pub struct JoinMembers<'info> {
               seeds = [MEMBER_SEED, (members.count + 1).to_le_bytes().as_ref()], bump)]
     pub member: Account<'info, Member>,
 
+    /// The seat after the last. It may exist already, empty, from when the
+    /// roster was longer.
+    #[account(init_if_needed, payer = owner, space = 8 + Seat::INIT_SPACE,
+              seeds = [SEAT_SEED, (members.seated + 1).to_le_bytes().as_ref()], bump)]
+    pub seat: Account<'info, Seat>,
+
     #[account(init_if_needed, payer = owner, seeds = [STAKES_SEED], bump,
               token::mint = coin_mint, token::authority = pool)]
     pub stakes: Account<'info, TokenAccount>,
@@ -1769,6 +1873,9 @@ pub struct JoinMembers<'info> {
 #[derive(Accounts)]
 pub struct AskToLeave<'info> {
     pub owner: Signer<'info>,
+
+    #[account(mut, seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
 
     #[account(mut, seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump,
               has_one = owner @ SasonaError::NotTheOwner)]
@@ -1824,7 +1931,7 @@ pub struct OpenEvidence<'info> {
     #[account(has_one = reader @ SasonaError::NotTheReader)]
     pub reading: Account<'info, Reading>,
 
-    #[account(init, payer = reader, space = 8 + 32 + 4 + len as usize,
+    #[account(init, payer = reader, space = 8 + 32 + 1 + 4 + len as usize,
               seeds = [EVIDENCE_SEED, reading.key().as_ref()], bump)]
     pub evidence: Account<'info, Evidence>,
 
@@ -1850,7 +1957,7 @@ pub struct AnswerChallenge<'info> {
 
     pub reading: Account<'info, Reading>,
 
-    #[account(seeds = [EVIDENCE_SEED, reading.key().as_ref()], bump, has_one = reading)]
+    #[account(mut, seeds = [EVIDENCE_SEED, reading.key().as_ref()], bump, has_one = reading)]
     pub evidence: Account<'info, Evidence>,
 
     #[account(seeds = [NONCE_SEED, nonce.as_ref()], bump)]
@@ -1871,6 +1978,9 @@ pub struct UpholdChallenge<'info> {
 
     #[account(mut)]
     pub reading: Account<'info, Reading>,
+
+    #[account(mut, seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
 
     #[account(mut, seeds = [MEMBER_SEED, reading.member.to_le_bytes().as_ref()], bump = member.bump)]
     pub member: Account<'info, Member>,
@@ -2015,26 +2125,42 @@ pub struct Reading {
     pub bump: u8,
     /// The membership that took it, or 0 for a reading taken before members.
     pub member: u32,
+    /// When it was revealed, for the 30 days it can be challenged.
+    pub reveal_time: i64,
 }
 
-/// How many memberships have ever been taken.
+/// How many memberships have ever been taken, and how many seats the roster
+/// has now (SPEC.md 4.2).
 #[account]
 #[derive(InitSpace)]
 pub struct Members {
     pub count: u32,
+    pub seated: u32,
     pub bump: u8,
 }
 
-/// One membership: one stake, held by `owner` (SPEC.md 4.1).
+/// One membership: one stake, held by `owner` (SPEC.md 4.1). `seat` is 0
+/// once it has left the roster.
 #[account]
 #[derive(InitSpace)]
 pub struct Member {
     pub owner: Pubkey,
     pub number: u32,
+    pub seat: u32,
     pub state: u8,
     pub stake: u64,
     pub leave_at: i64,
     pub open_challenges: u32,
+    pub bump: u8,
+}
+
+/// One seat of the roster, and the membership in it; `member` is 0 while the
+/// seat is past the end of the roster.
+#[account]
+#[derive(InitSpace)]
+pub struct Seat {
+    pub member: u32,
+    pub owner: Pubkey,
     pub bump: u8,
 }
 
@@ -2044,15 +2170,16 @@ pub struct Member {
 pub struct Challenge {
     pub reading: Pubkey,
     pub challenger: Pubkey,
-    pub deadline_slot: u64,
+    pub deadline: i64,
     pub state: u8,
     pub bump: u8,
 }
 
-/// A reading's reply, put on chain by its reader.
+/// A reading's reply, put on chain by its reader. Sealed once an answer holds.
 #[account]
 pub struct Evidence {
     pub reading: Pubkey,
+    pub sealed: bool,
     pub reply: Vec<u8>,
 }
 
@@ -2211,6 +2338,7 @@ pub struct ReadingRevealed {
 pub struct MemberJoined {
     pub owner: Pubkey,
     pub number: u32,
+    pub seat: u32,
     pub stake: u64,
 }
 
@@ -2230,7 +2358,7 @@ pub struct MemberLeft {
 pub struct Challenged {
     pub reading: Pubkey,
     pub challenger: Pubkey,
-    pub deadline_slot: u64,
+    pub deadline: i64,
 }
 
 #[event]
@@ -2500,7 +2628,7 @@ pub enum SasonaError {
     AlreadySettled,
     #[msg("That membership was not drawn to read this service")]
     NotDrawn,
-    #[msg("A membership passed over in the draw was active and could have read")]
+    #[msg("A seat passed over in the draw holds a membership that could have read")]
     NotSkippable,
     #[msg("This membership is not active")]
     NotActive,
@@ -2514,7 +2642,7 @@ pub enum SasonaError {
     NoMember,
     #[msg("This challenge has already been settled")]
     ChallengeClosed,
-    #[msg("A reply on chain is at most 10,000 bytes")]
+    #[msg("A reply is at most 10,000 bytes")]
     ReplyTooLong,
     #[msg("The reply on chain does not hash to what the reading recorded")]
     NotTheReply,
@@ -2522,6 +2650,12 @@ pub enum SasonaError {
     VerdictDoesNotFollow,
     #[msg("That is not who challenged")]
     NotTheChallenger,
+    #[msg("That is not the seat named, or not the membership in it")]
+    NotTheSeat,
+    #[msg("The reply on chain was answered with and can no longer change")]
+    EvidenceSealed,
+    #[msg("The time allowed for this has passed")]
+    WindowClosed,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

@@ -482,6 +482,7 @@ pub fn commit_reading_ix(svm: &LiteSVM, reader: Address, round: Address, endpoin
     let accounts = sasona::accounts::CommitReading {
         reader: key(reader),
         round: key(round),
+        members: key(members_address()),
         member: key(member),
         reading: key(reading_address(round, endpoint)),
         system_program: anchor_lang::system_program::ID,
@@ -520,6 +521,7 @@ pub fn commit_second_ix(svm: &LiteSVM, reader: Address, round: Address, endpoint
     let accounts = sasona::accounts::CommitSecondReading {
         reader: key(reader),
         round: key(round),
+        members: key(members_address()),
         member: key(member),
         reading: key(reading),
         first: key(first),
@@ -573,14 +575,29 @@ pub fn member(svm: &LiteSVM, number: u32) -> sasona::Member {
     read(svm, member_address(number))
 }
 
-pub fn member_count(svm: &LiteSVM) -> u32 {
-    svm.get_account(&members_address())
-        .and_then(|a| sasona::Members::try_deserialize(&mut a.data.as_slice()).ok())
-        .map(|m| m.count)
-        .unwrap_or(0)
+pub fn members_state(svm: &LiteSVM) -> Option<sasona::Members> {
+    svm.get_account(&members_address()).and_then(|a| sasona::Members::try_deserialize(&mut a.data.as_slice()).ok())
 }
 
-pub fn join_members_ix(owner: Address, number: u32) -> Instruction {
+/// Memberships ever taken.
+pub fn member_count(svm: &LiteSVM) -> u32 {
+    members_state(svm).map(|m| m.count).unwrap_or(0)
+}
+
+/// Seats on the roster now.
+pub fn seated(svm: &LiteSVM) -> u32 {
+    members_state(svm).map(|m| m.seated).unwrap_or(0)
+}
+
+pub fn seat_address(k: u32) -> Address {
+    pda(&[sasona::SEAT_SEED, &k.to_le_bytes()])
+}
+
+pub fn seat(svm: &LiteSVM, k: u32) -> sasona::Seat {
+    read(svm, seat_address(k))
+}
+
+pub fn join_members_ix(owner: Address, number: u32, seat: u32) -> Instruction {
     let coin = pda(&[COIN_SEED]);
     let accounts = sasona::accounts::JoinMembers {
         owner: key(owner),
@@ -589,6 +606,7 @@ pub fn join_members_ix(owner: Address, number: u32) -> Instruction {
         owner_coin: key(ata(owner, coin)),
         members: key(members_address()),
         member: key(member_address(number)),
+        seat: key(seat_address(seat)),
         stakes: key(pda(&[sasona::STAKES_SEED])),
         held: key(pda(&[sasona::HELD_SEED])),
         token_program: anchor_spl::token::ID,
@@ -601,7 +619,8 @@ pub fn join_members_ix(owner: Address, number: u32) -> Instruction {
 /// Take a membership for `who`, who must hold the coins. Returns its number.
 pub fn join(svm: &mut LiteSVM, who: &Keypair) -> u32 {
     let number = member_count(svm) + 1;
-    try_ix(svm, join_members_ix(who.pubkey(), number), who).expect("join");
+    let s = seated(svm) + 1;
+    try_ix(svm, join_members_ix(who.pubkey(), number, s), who).expect("join");
     number
 }
 
@@ -623,9 +642,29 @@ pub fn world_with_member() -> World {
     w
 }
 
-pub fn ask_to_leave_ix(owner: Address, number: u32) -> Instruction {
-    let accounts = sasona::accounts::AskToLeave { owner: key(owner), member: key(member_address(number)) }.to_account_metas(None);
-    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AskToLeave {}.data() }
+/// The accounts that take membership `number` off the roster: its seat, and
+/// unless it sits last, the last seat and the membership in it.
+pub fn unseat_accounts(svm: &LiteSVM, number: u32) -> Vec<AccountMeta> {
+    let k = member(svm, number).seat;
+    let last = seated(svm);
+    let mut out = vec![AccountMeta::new(seat_address(k), false)];
+    if k != last && k != 0 {
+        out.push(AccountMeta::new(seat_address(last), false));
+        out.push(AccountMeta::new(member_address(seat(svm, last).member), false));
+    }
+    out
+}
+
+pub fn ask_to_leave_ix(svm: &LiteSVM, owner: Address, number: u32) -> Instruction {
+    let accounts = sasona::accounts::AskToLeave {
+        owner: key(owner),
+        members: key(members_address()),
+        member: key(member_address(number)),
+    }
+    .to_account_metas(None);
+    let mut accounts = metas(accounts);
+    accounts.extend(unseat_accounts(svm, number));
+    Instruction { program_id: program_id(), accounts, data: sasona::instruction::AskToLeave {}.data() }
 }
 
 pub fn leave_ix(owner: Address, number: u32) -> Instruction {
@@ -643,8 +682,8 @@ pub fn leave_ix(owner: Address, number: u32) -> Instruction {
     Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Leave {}.data() }
 }
 
-/// SPEC.md 4.3, followed against the accounts: the membership drawn for
-/// `endpoint` in `round`, and those passed over before it.
+/// SPEC.md 4.3, followed against the accounts: the seat drawn for
+/// `endpoint` in `round`, and the seats passed over that must be shown.
 pub fn drawn_for(svm: &LiteSVM, round: Address, endpoint: &str, first_reader: Option<Address>) -> (Option<u32>, Vec<u32>) {
     let r: sasona::Round = read(svm, round);
     let mut skipped = vec![];
@@ -652,13 +691,17 @@ pub fn drawn_for(svm: &LiteSVM, round: Address, endpoint: &str, first_reader: Op
         return (None, skipped);
     }
     let h = sha256(endpoint.as_bytes());
+    let now = seated(svm);
     for a in 0..sasona::MAX_READER_ATTEMPTS {
         let k = sasona::reader_number(&r.final_seed, &h, a, r.members);
-        let m = member(svm, k);
-        if m.state == sasona::MEMBER_ACTIVE && Some(addr(m.owner)) != first_reader {
-            return (Some(k), skipped);
+        if k > now {
+            continue;
         }
-        skipped.push(k);
+        if Some(addr(seat(svm, k).owner)) == first_reader {
+            skipped.push(k);
+            continue;
+        }
+        return (Some(k), skipped);
     }
     (None, skipped)
 }
@@ -666,12 +709,13 @@ pub fn drawn_for(svm: &LiteSVM, round: Address, endpoint: &str, first_reader: Op
 fn reader_accounts(svm: &LiteSVM, reader: Address, round: Address, endpoint: &str, first_reader: Option<Address>) -> (Address, Vec<Address>) {
     let (drawn, skipped) = drawn_for(svm, round, endpoint, first_reader);
     if let Some(k) = drawn {
-        if addr(member(svm, k).owner) == reader {
-            return (member_address(k), skipped.into_iter().map(member_address).collect());
+        let s = seat(svm, k);
+        if addr(s.owner) == reader {
+            return (member_address(s.member), skipped.into_iter().map(seat_address).collect());
         }
     }
     let own = (1..=member_count(svm)).find(|&n| addr(member(svm, n).owner) == reader);
-    (member_address(own.or(drawn).unwrap_or(1)), vec![])
+    (member_address(own.unwrap_or(1)), vec![])
 }
 
 // --------------------------------------------------------------- challenges
@@ -748,10 +792,12 @@ pub fn answer_ix(svm: &LiteSVM, reading: Address, nonce: [u8; 16]) -> Instructio
 
 pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
     let c: sasona::Challenge = read(svm, challenge_address(reading));
+    let r: sasona::Reading = read(svm, reading);
     let coin = pda(&[COIN_SEED]);
     let accounts = sasona::accounts::UpholdChallenge {
         challenge: key(challenge_address(reading)),
         reading: key(reading),
+        members: key(members_address()),
         member: key(member_of(svm, reading)),
         pool: key(pda(&[POOL_SEED])),
         coin_mint: key(coin),
@@ -762,5 +808,9 @@ pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
         token_program: anchor_spl::token::ID,
     }
     .to_account_metas(None);
-    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::UpholdChallenge {}.data() }
+    let mut accounts = metas(accounts);
+    if member(svm, r.member).seat > 0 {
+        accounts.extend(unseat_accounts(svm, r.member));
+    }
+    Instruction { program_id: program_id(), accounts, data: sasona::instruction::UpholdChallenge {}.data() }
 }

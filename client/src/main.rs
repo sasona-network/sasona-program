@@ -44,7 +44,7 @@ use anchor_client::anchor_lang::prelude::AccountMeta;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
     NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
-    CHALLENGE_SEED, EVIDENCE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, STAKES_SEED,
+    CHALLENGE_SEED, EVIDENCE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -118,23 +118,45 @@ fn main() {
     let coin = pda(&[COIN_SEED]);
 
     let member_pda = |n: u32| pda(&[MEMBER_SEED, &n.to_le_bytes()]);
-    // SPEC.md 4.3: this keypair's membership if it was drawn for the service,
-    // and the memberships passed over before it.
+    let seat_pda = |k: u32| pda(&[SEAT_SEED, &k.to_le_bytes()]);
+    let members_now = || -> sasona::Members { program.account(pda(&[MEMBERS_SEED])).expect("members") };
+    // SPEC.md 4.3: this keypair's membership if its seat was drawn for the
+    // service, and the seats passed over that have to be shown.
     let drawn = |round: &Pubkey, endpoint_hash: &[u8; 32], first_reader: Option<Pubkey>| -> (Pubkey, Vec<AccountMeta>) {
         let r: sasona::Round = program.account(*round).expect("round");
         assert!(r.members > 0, "nobody was a member when this round was opened");
+        let seated = members_now().seated;
         let mut skipped = vec![];
         for a in 0..sasona::MAX_READER_ATTEMPTS {
             let k = sasona::reader_number(&r.final_seed, endpoint_hash, a, r.members);
-            let m: sasona::Member = program.account(member_pda(k)).expect("membership");
-            if m.state == sasona::MEMBER_ACTIVE && Some(m.owner) != first_reader {
-                assert_eq!(m.owner, me, "membership {k} was drawn for this service, and it is not yours");
-                eprintln!("drawn: membership {k}, after passing over {}", skipped.len());
-                return (member_pda(k), skipped);
+            if k > seated {
+                continue;
             }
-            skipped.push(AccountMeta::new_readonly(member_pda(k), false));
+            let s: sasona::Seat = program.account(seat_pda(k)).expect("seat");
+            if Some(s.owner) == first_reader {
+                skipped.push(AccountMeta::new_readonly(seat_pda(k), false));
+                continue;
+            }
+            assert_eq!(s.owner, me, "seat {k} was drawn for this service, and it is not yours");
+            eprintln!("drawn: seat {k}, membership {}", s.member);
+            return (member_pda(s.member), skipped);
         }
-        panic!("no membership qualified in {} attempts: nobody reads this service in this round", sasona::MAX_READER_ATTEMPTS);
+        panic!("no seat qualified in {} attempts: nobody reads this service in this round", sasona::MAX_READER_ATTEMPTS);
+    };
+    // SPEC.md 4.2: the accounts that take a membership off the roster.
+    let unseat = |number: u32| -> Vec<AccountMeta> {
+        let k: u32 = { let m: sasona::Member = program.account(member_pda(number)).expect("membership"); m.seat };
+        if k == 0 {
+            return vec![];
+        }
+        let last = members_now().seated;
+        let mut out = vec![AccountMeta::new(seat_pda(k), false)];
+        if k != last {
+            let l: sasona::Seat = program.account(seat_pda(last)).expect("last seat");
+            out.push(AccountMeta::new(seat_pda(last), false));
+            out.push(AccountMeta::new(member_pda(l.member), false));
+        }
+        out
     };
     let reading_of = |reading: &Pubkey| -> sasona::Reading { program.account(*reading).expect("reading") };
 
@@ -164,8 +186,9 @@ fn main() {
     let request = program.request();
     let request = if command == "member-join" {
         let members: Option<sasona::Members> = program.account(pda(&[MEMBERS_SEED])).ok();
-        let number = members.map(|m| m.count).unwrap_or(0) + 1;
-        eprintln!("membership {number}");
+        let number = members.as_ref().map(|m| m.count).unwrap_or(0) + 1;
+        let seat = members.as_ref().map(|m| m.seated).unwrap_or(0) + 1;
+        eprintln!("membership {number}, seat {seat}");
         request
             .accounts(sasona::accounts::JoinMembers {
                 owner: me,
@@ -174,6 +197,7 @@ fn main() {
                 owner_coin: get_associated_token_address(&me, &coin),
                 members: pda(&[MEMBERS_SEED]),
                 member: member_pda(number),
+                seat: seat_pda(seat),
                 stakes: pda(&[STAKES_SEED]),
                 held: pda(&[HELD_SEED]),
                 token_program: anchor_spl::token::ID,
@@ -183,7 +207,8 @@ fn main() {
     } else if command == "member-ask-leave" {
         let number: u32 = args[2].parse().expect("membership number");
         request
-            .accounts(sasona::accounts::AskToLeave { owner: me, member: member_pda(number) })
+            .accounts(sasona::accounts::AskToLeave { owner: me, members: pda(&[MEMBERS_SEED]), member: member_pda(number) })
+            .accounts(unseat(number))
             .args(sasona::instruction::AskToLeave {})
     } else if command == "member-leave" {
         let number: u32 = args[2].parse().expect("membership number");
@@ -232,6 +257,7 @@ fn main() {
             .accounts(sasona::accounts::UpholdChallenge {
                 challenge: pda(&[CHALLENGE_SEED, reading.as_ref()]),
                 reading,
+                members: pda(&[MEMBERS_SEED]),
                 member: member_pda(r.member),
                 pool: pda(&[POOL_SEED]),
                 coin_mint: coin,
@@ -241,6 +267,7 @@ fn main() {
                 challenger_coin: get_associated_token_address(&c.challenger, &coin),
                 token_program: anchor_spl::token::ID,
             })
+            .accounts(unseat(r.member))
             .args(sasona::instruction::UpholdChallenge {})
     } else if command == "open" {
         request
@@ -404,6 +431,7 @@ fn main() {
             .accounts(sasona::accounts::CommitReading {
                 reader: me,
                 round,
+                members: pda(&[MEMBERS_SEED]),
                 member,
                 reading: pda(&[READING_SEED, round.as_ref(), &endpoint_hash]),
                 system_program: anchor_client::anchor_lang::system_program::ID,
@@ -437,6 +465,7 @@ fn main() {
             .accounts(sasona::accounts::CommitSecondReading {
                 reader: me,
                 round,
+                members: pda(&[MEMBERS_SEED]),
                 member,
                 reading,
                 first,

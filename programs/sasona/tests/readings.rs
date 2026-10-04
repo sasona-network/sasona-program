@@ -67,7 +67,7 @@ fn a_service_copying_the_nonce_cannot_block_the_honest_reading() {
     let (service, _) = new_member(&mut w.svm);
     // The honest member steps away, so the service is drawn in its own round.
     let d0 = w.depositor.insecure_clone();
-    try_ix(&mut w.svm, ask_to_leave_ix(d0.pubkey(), 1), &d0).unwrap();
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, d0.pubkey(), 1), &d0).unwrap();
     let fp = [91u8; 32];
     w.svm.warp_to_slot(1_101);
     try_ix(&mut w.svm, open_round_ix(service.pubkey(), fp, 5, 1, sha256(&[2u8; 32])), &service).unwrap();
@@ -262,7 +262,7 @@ fn the_service_must_be_a_clean_url_matching_its_hash() {
     // The hash that places the reading must be the hash of the service named.
     let other = "https://other.example/x";
     let mut ix = commit_reading_ix(&w.svm, d.pubkey(), round, SERVICE, q);
-    ix.accounts[3].pubkey = reading_address(round, other);
+    ix.accounts[4].pubkey = reading_address(round, other);
     ix.data = anchor_lang::InstructionData::data(&sasona::instruction::CommitReading {
         endpoint_hash: sha256(other.as_bytes()),
         endpoint: SERVICE.to_string(),
