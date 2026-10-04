@@ -108,6 +108,11 @@ pub fn world_with(sigverify: bool) -> World {
     // The simulator's clock starts far ahead, and tests set slots in the
     // thousands. A chain's slots only go forward, so start at the beginning.
     svm.warp_to_slot(1);
+    // And its clock starts at 1970. A chain's starts at today, so that a time
+    // left at zero, never recorded, looks long past and not just now.
+    let mut clock: solana_clock::Clock = svm.get_sysvar();
+    clock.unix_timestamp = 1_790_000_000;
+    svm.set_sysvar(&clock);
     let so = std::env::var("SASONA_SO").expect("run through scripts/build.sh, which sets SASONA_SO");
     svm.add_program_from_file(program_id(), so).unwrap();
 

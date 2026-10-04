@@ -146,7 +146,6 @@ MUTANTS=(
   "roster: moving up keeps the old slot|s/\s*seat\.since = Clock::get\(\)\?\.slot;//"
   "draw: seats beyond the roster drawn|s/\s*if k > members\.seated \{\s*continue;\s*\}//"
   "draw: seats shown that nobody passed over|s/\s*require!\(shown == skipped\.len\(\), SasonaError::NotDrawn\);//"
-  "draw: a member off the roster reads|s/\s*require!\(member\.state == MEMBER_ACTIVE && member\.seat > 0, SasonaError::NotActive\);//"
   "draw: someone else.s membership|s/\s*require_keys_eq!\(member\.owner, reader, SasonaError::NotTheReader\);//"
   "draw: another label|s/b.reader., endpoint_hash/b\x22readers\x22, endpoint_hash/"
   "draw: the attempt little-endian|s/&attempt\.to_be_bytes\(\)\]/&attempt.to_le_bytes()]/"

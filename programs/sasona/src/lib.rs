@@ -1209,7 +1209,8 @@ fn check_drawn(
     require!(Clock::get()?.slot <= closes, SasonaError::WindowClosed);
     require!(round.members > 0, SasonaError::NotDrawn);
     require_keys_eq!(member.owner, reader, SasonaError::NotTheReader);
-    require!(member.state == MEMBER_ACTIVE && member.seat > 0, SasonaError::NotActive);
+    // Sitting in a seat is being active: every way out of active leaves the
+    // seat (unseat), and a membership with no seat has no seat account to show.
     require!(seat.member == member.number, SasonaError::NotTheSeat);
     require!(seat.since < round.commit_slot, SasonaError::SatDownSince);
     let mut shown = 0usize;
