@@ -463,3 +463,45 @@ pub fn slot_hash(slot: u64) -> [u8; 32] {
 pub fn recent(now: u64, skipped: &[u64]) -> Vec<(u64, [u8; 32])> {
     (now.saturating_sub(512)..now).rev().filter(|s| !skipped.contains(s)).map(|s| (s, slot_hash(s))).collect()
 }
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    solana_sha256_hasher::hashv(&[data]).to_bytes()
+}
+
+pub fn reading_address(round: Address, endpoint: &str) -> Address {
+    pda(&[sasona::READING_SEED, round.as_ref(), &sha256(endpoint.as_bytes())])
+}
+
+pub fn commit_reading_ix(reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32]) -> Instruction {
+    let accounts = sasona::accounts::CommitReading {
+        reader: key(reader),
+        round: key(round),
+        reading: key(reading_address(round, endpoint)),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::CommitReading {
+        endpoint_hash: sha256(endpoint.as_bytes()),
+        endpoint: endpoint.to_string(),
+        question_hash,
+    }
+    .data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8) -> Instruction {
+    let accounts = sasona::accounts::RevealReading {
+        reader: key(reader),
+        reading: key(reading),
+        used_nonce: key(pda(&[sasona::NONCE_SEED, &nonce])),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::RevealReading { nonce, reply_hash, verdict }.data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+pub fn lapsed_ix(reading: Address) -> Instruction {
+    let accounts = sasona::accounts::MarkLapsed { reading: key(reading) }.to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::MarkLapsed {}.data() }
+}

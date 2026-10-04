@@ -12,6 +12,8 @@
 //!     sasona open-round <candidates file> <count> --keypair <path>
 //!     sasona reveal-round <candidates file> --keypair <path>
 //!     sasona withheld <candidates file> --keypair <path>
+//!     sasona commit-reading <round> <service url> <question hash hex> --keypair <path>
+//!     sasona reveal-reading <round> <service url> <nonce hex> <reply hash hex> <verdict> --keypair <path>
 //!
 //! A round is found by its list's fingerprint. open-round keeps the seed in
 //! `<keypair>.round-<fingerprint>.seed` until it is revealed; anyone who
@@ -27,7 +29,7 @@ use anchor_client::{Client, Cluster, CommitmentConfig};
 use anchor_spl::associated_token::get_associated_token_address;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
-    POOL_SEED, POOL_USD_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
+    NONCE_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -43,6 +45,15 @@ const USAGE: &str = "usage: sasona <open|deposit|fee|depth> <dollars> --keypair 
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn unhex<const N: usize>(s: &str) -> [u8; N] {
+    assert_eq!(s.len(), 2 * N, "expected {} hex characters", 2 * N);
+    let mut out = [0u8; N];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex");
+    }
+    out
 }
 
 fn candidates_in(path: &str) -> Vec<String> {
@@ -73,11 +84,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair_path = arg(&args, "--keypair").expect(USAGE);
     let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
@@ -244,6 +255,34 @@ fn main() {
                 slot_hashes: sasona::SLOT_HASHES_ID,
             })
             .args(sasona::instruction::MarkWithheld {})
+    } else if command == "commit-reading" {
+        let round: Pubkey = args[2].parse().expect("round address");
+        let endpoint = args[3].clone();
+        let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
+        request
+            .accounts(sasona::accounts::CommitReading {
+                reader: me,
+                round,
+                reading: pda(&[READING_SEED, round.as_ref(), &endpoint_hash]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::CommitReading { endpoint_hash, endpoint, question_hash: unhex::<32>(&args[4]) })
+    } else if command == "reveal-reading" {
+        let round: Pubkey = args[2].parse().expect("round address");
+        let endpoint_hash: [u8; 32] = sha2::Sha256::digest(args[3].as_bytes()).into();
+        let nonce = unhex::<16>(&args[4]);
+        request
+            .accounts(sasona::accounts::RevealReading {
+                reader: me,
+                reading: pda(&[READING_SEED, round.as_ref(), &endpoint_hash]),
+                used_nonce: pda(&[NONCE_SEED, &nonce]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::RevealReading {
+                nonce,
+                reply_hash: unhex::<32>(&args[5]),
+                verdict: args[6].parse().expect("verdict"),
+            })
     } else if command == "settle" {
         request
             .accounts(sasona::accounts::SettleEntryFees {

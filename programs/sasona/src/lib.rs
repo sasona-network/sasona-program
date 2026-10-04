@@ -128,6 +128,19 @@ pub const MAX_ROUND_CANDIDATES: u32 = 65_536;
 /// not free. 0.1 SOL.
 pub const ROUND_BOND_LAMPORTS: u64 = 100_000_000;
 
+/// Readings of drawn services; sasona-protocol SPEC.md section 2 is the rule.
+/// The question's hash is committed before the service is called and the
+/// question revealed after.
+pub const READING_SEED: &[u8] = b"reading";
+/// About an hour. A reading not revealed by then can only be marked lapsed.
+pub const REVEAL_WINDOW_SLOTS: u64 = 9_000;
+pub const MAX_ENDPOINT_LEN: usize = 256;
+pub const NONCE_SEED: &[u8] = b"nonce";
+
+pub const READING_COMMITTED: u8 = 0;
+pub const READING_REVEALED: u8 = 1;
+pub const READING_LAPSED: u8 = 2;
+
 /// NOTE, temporary: who may approve a claim. Deciding claims belongs to
 /// members drawn at random, which is part 7 of the roadmap. Until then it is
 /// the key that can already upgrade this program, so nothing new is trusted.
@@ -481,6 +494,94 @@ pub mod sasona {
         require!(matches!(entropy_for(&data, target)?, Entropy::Gone), SasonaError::NotWithheldYet);
         r.state = ROUND_WITHHELD;
         emit!(RoundWithheld { round: r.key() });
+        Ok(())
+    }
+
+    /// Commit to the question for one service of a drawn round, before
+    /// calling it.
+    ///
+    /// NOTE, temporary: the round's opener is the one who reads, until
+    /// members are on chain (part 5). Whether the service is one of the
+    /// round's picks is checked off chain, against the published list.
+    pub fn commit_reading(
+        ctx: Context<CommitReading>,
+        endpoint_hash: [u8; 32],
+        endpoint: String,
+        question_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(ctx.accounts.round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
+        require!(
+            !endpoint.is_empty()
+                && endpoint.len() <= MAX_ENDPOINT_LEN
+                && endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)),
+            SasonaError::BadEndpoint
+        );
+        require!(
+            solana_sha256_hasher::hashv(&[endpoint.as_bytes()]).to_bytes() == endpoint_hash,
+            SasonaError::BadEndpoint
+        );
+        let r = &mut ctx.accounts.reading;
+        r.round = ctx.accounts.round.key();
+        r.endpoint = endpoint;
+        r.reader = ctx.accounts.reader.key();
+        r.question_hash = question_hash;
+        r.commit_slot = Clock::get()?.slot;
+        r.state = READING_COMMITTED;
+        r.bump = ctx.bumps.reading;
+        emit!(ReadingCommitted { reading: r.key(), round: r.round, question_hash, commit_slot: r.commit_slot });
+        Ok(())
+    }
+
+    /// Reveal the nonce, the reply's hash and the verdict.
+    ///
+    /// The program builds the question from the nonce itself (SPEC.md 2.3)
+    /// and refuses unless it is the one committed, so only the fair question
+    /// for this nonce can be revealed.
+    ///
+    /// A nonce belongs to the reading that committed to it earliest. The
+    /// service sees the nonce when it is called, after the honest reading was
+    /// committed, so it can copy the nonce into a reading of its own but never
+    /// one committed earlier. If the copy is revealed first, the honest reveal
+    /// takes the nonce back, and the copy no longer counts. A reading whose
+    /// nonce is held by an earlier one cannot be revealed.
+    ///
+    /// The verdict is checked by anyone holding the reply, against SPEC.md 2.4.
+    pub fn reveal_reading(ctx: Context<RevealReading>, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8) -> Result<()> {
+        let r = &mut ctx.accounts.reading;
+        require!(r.state == READING_COMMITTED, SasonaError::ReadingNotOpen);
+        let now = Clock::get()?.slot;
+        require!(now > r.commit_slot, SasonaError::TooEarly);
+        require!(now <= r.commit_slot + REVEAL_WINDOW_SLOTS, SasonaError::TooLate);
+        let question = canonical_question(&nonce);
+        require!(solana_sha256_hasher::hashv(&[&question]).to_bytes() == r.question_hash, SasonaError::WrongQuestion);
+        require!((1..=3).contains(&verdict), SasonaError::BadVerdict);
+
+        let this = r.key();
+        let committed = r.commit_slot;
+        let used = &mut ctx.accounts.used_nonce;
+        if used.reading != Pubkey::default() {
+            // Held already: only a reading committed strictly earlier takes it.
+            require!(committed < used.commit_slot, SasonaError::NonceTaken);
+        }
+        used.reading = this;
+        used.commit_slot = committed;
+
+        let r = &mut ctx.accounts.reading;
+        r.reply_hash = reply_hash;
+        r.verdict = verdict;
+        r.reveal_slot = now;
+        r.state = READING_REVEALED;
+        emit!(ReadingRevealed { reading: r.key(), reply_hash, verdict, reveal_slot: now });
+        Ok(())
+    }
+
+    /// Mark a reading whose question was not revealed in time.
+    pub fn mark_lapsed(ctx: Context<MarkLapsed>) -> Result<()> {
+        let r = &mut ctx.accounts.reading;
+        require!(r.state == READING_COMMITTED, SasonaError::ReadingNotOpen);
+        require!(Clock::get()?.slot > r.commit_slot + REVEAL_WINDOW_SLOTS, SasonaError::NotLapsedYet);
+        r.state = READING_LAPSED;
+        emit!(ReadingLapsed { reading: r.key() });
         Ok(())
     }
 
@@ -1034,6 +1135,46 @@ pub struct MarkWithheld<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(endpoint_hash: [u8; 32])]
+pub struct CommitReading<'info> {
+    #[account(mut, address = round.opener @ SasonaError::NotTheReader)]
+    pub reader: Signer<'info>,
+
+    #[account(seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
+    pub round: Account<'info, Round>,
+
+    #[account(init, payer = reader, space = 8 + Reading::INIT_SPACE,
+              seeds = [READING_SEED, round.key().as_ref(), endpoint_hash.as_ref()], bump)]
+    pub reading: Account<'info, Reading>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(nonce: [u8; 16])]
+pub struct RevealReading<'info> {
+    #[account(mut)]
+    pub reader: Signer<'info>,
+
+    #[account(mut, has_one = reader @ SasonaError::NotTheReader)]
+    pub reading: Account<'info, Reading>,
+
+    /// Which reading a nonce belongs to: the earliest committed that has
+    /// revealed it.
+    #[account(init_if_needed, payer = reader, space = 8 + UsedNonce::INIT_SPACE,
+              seeds = [NONCE_SEED, nonce.as_ref()], bump)]
+    pub used_nonce: Account<'info, UsedNonce>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MarkLapsed<'info> {
+    #[account(mut)]
+    pub reading: Account<'info, Reading>,
+}
+
+#[derive(Accounts)]
 pub struct JoinCover<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
@@ -1252,6 +1393,70 @@ pub struct Round {
     pub bump: u8,
 }
 
+/// One test of one drawn service: the question's hash before the call, and
+/// after it the reply's hash and the verdict.
+#[account]
+#[derive(InitSpace)]
+pub struct Reading {
+    pub round: Pubkey,
+    #[max_len(256)]
+    pub endpoint: String,
+    pub reader: Pubkey,
+    pub question_hash: [u8; 32],
+    pub commit_slot: u64,
+    pub state: u8,
+    pub reply_hash: [u8; 32],
+    pub verdict: u8,
+    pub reveal_slot: u64,
+    pub bump: u8,
+}
+
+/// A revealed nonce, and the reading it belongs to: the earliest committed of
+/// those that revealed it. A verifier counts a reading only if its nonce's
+/// record names it.
+#[account]
+#[derive(InitSpace)]
+pub struct UsedNonce {
+    pub reading: Pubkey,
+    pub commit_slot: u64,
+}
+
+/// SPEC.md 2.1 to 2.3: the canonical question for a nonce, as bytes. The
+/// nonce is written as 32 lowercase hex characters.
+pub fn canonical_question(nonce: &[u8; 16]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = [0u8; 32];
+    for (i, b) in nonce.iter().enumerate() {
+        n[2 * i] = HEX[(b >> 4) as usize];
+        n[2 * i + 1] = HEX[(b & 15) as usize];
+    }
+    let digest = solana_sha256_hasher::hashv(&[&n]).to_bytes();
+    let mut expect = [0u8; 16];
+    for (i, b) in digest[..8].iter().enumerate() {
+        expect[2 * i] = HEX[(b >> 4) as usize];
+        expect[2 * i + 1] = HEX[(b & 15) as usize];
+    }
+    // The code as a JSON string: its quotes escaped, its newline as \n.
+    let mut code = Vec::with_capacity(96);
+    code.extend_from_slice(b"\"import hashlib\\nprint(hashlib.sha256(\\\"");
+    code.extend_from_slice(&n);
+    code.extend_from_slice(b"\\\".encode()).hexdigest()[:16])\"");
+
+    let mut q = Vec::with_capacity(512);
+    q.extend_from_slice(b"{\"body\":{\"code\":");
+    q.extend_from_slice(&code);
+    q.extend_from_slice(b",\"language\":\"python\"},\"capability\":\"execute\",\"code\":");
+    q.extend_from_slice(&code);
+    q.extend_from_slice(b",\"command\":[\"python\",\"-c\",");
+    q.extend_from_slice(&code);
+    q.extend_from_slice(b"],\"expect\":\"");
+    q.extend_from_slice(&expect);
+    q.extend_from_slice(b"\",\"nonce\":\"");
+    q.extend_from_slice(&n);
+    q.extend_from_slice(b"\",\"tier\":1}");
+    q
+}
+
 pub enum Entropy {
     Found(u64, [u8; 32]),
     TooEarly,
@@ -1328,6 +1533,27 @@ pub struct FeePaid {
     pub reserve: u64,
     pub burned: u64,
     pub shared: u64,
+}
+
+#[event]
+pub struct ReadingCommitted {
+    pub reading: Pubkey,
+    pub round: Pubkey,
+    pub question_hash: [u8; 32],
+    pub commit_slot: u64,
+}
+
+#[event]
+pub struct ReadingRevealed {
+    pub reading: Pubkey,
+    pub reply_hash: [u8; 32],
+    pub verdict: u8,
+    pub reveal_slot: u64,
+}
+
+#[event]
+pub struct ReadingLapsed {
+    pub reading: Pubkey,
 }
 
 #[event]
@@ -1544,6 +1770,22 @@ pub enum SasonaError {
     NotWithheldYet,
     #[msg("The SlotHashes sysvar could not be read")]
     BadSlotHashes,
+    #[msg("Readings are only taken of a round that has been drawn")]
+    RoundNotDrawn,
+    #[msg("A service is a printable ASCII URL of at most 256 bytes, and its hash must match")]
+    BadEndpoint,
+    #[msg("Only the reader may do that")]
+    NotTheReader,
+    #[msg("This reading is not waiting for its question")]
+    ReadingNotOpen,
+    #[msg("The question for that nonce is not the one committed")]
+    WrongQuestion,
+    #[msg("A verdict is 1 delivered, 2 wrong answer or 3 empty")]
+    BadVerdict,
+    #[msg("The reading can still be revealed")]
+    NotLapsedYet,
+    #[msg("That nonce belongs to a reading committed before this one")]
+    NonceTaken,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

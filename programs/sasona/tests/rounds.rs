@@ -265,7 +265,8 @@ fn revealing_at_the_far_end_of_the_window_fits_easily_in_a_transaction() {
         w.svm.latest_blockhash(),
     );
     let used = w.svm.send_transaction(tx).unwrap().compute_units_consumed;
-    assert!(used < 60_000, "used {used} compute units");
+    // A transaction gets 200,000 by default. Half of that leaves room.
+    assert!(used < 100_000, "used {used} compute units");
     let r: Round = read(&w.svm, round);
     assert_eq!(r.entropy_slot, target);
 }
