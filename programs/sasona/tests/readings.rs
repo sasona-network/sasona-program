@@ -19,7 +19,7 @@ fn hex32(s: &str) -> [u8; 32] {
 
 /// A world with a round opened by the depositor and drawn, at slot 1,100.
 fn drawn() -> (World, Address) {
-    let mut w = world();
+    let mut w = world_with_member();
     let d = w.depositor.insecure_clone();
     let seed = [42u8; 32];
     let fp = [77u8; 32];
@@ -33,7 +33,7 @@ fn drawn() -> (World, Address) {
 fn commit(w: &mut World, round: Address, endpoint: &str, nonce: [u8; 16]) -> Address {
     let d = w.depositor.insecure_clone();
     let q = sha256(&canonical_question(&nonce));
-    try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, endpoint, q), &d).unwrap();
+    try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, endpoint, q), &d).unwrap();
     reading_address(round, endpoint)
 }
 
@@ -59,18 +59,22 @@ fn nonce_owner(w: &World, nonce: [u8; 16]) -> Address {
 fn a_service_copying_the_nonce_cannot_block_the_honest_reading() {
     // The attack the review found: the service sees the nonce when it is
     // called, opens a round of its own, commits the same question and
-    // reveals it first, so the honest reading could never be revealed.
+    // reveals it first, so the honest reading could never be revealed. Here
+    // the service is a member, drawn in its own round.
     let (mut w, round) = drawn();
     let honest = commit(&mut w, round, SERVICE, VECTOR_NONCE); // slot 1,100
 
-    let (service, _) = newcomer(&mut w.svm, 0);
+    let (service, _) = new_member(&mut w.svm);
+    // The honest member steps away, so the service is drawn in its own round.
+    let d0 = w.depositor.insecure_clone();
+    try_ix(&mut w.svm, ask_to_leave_ix(d0.pubkey(), 1), &d0).unwrap();
     let fp = [91u8; 32];
     w.svm.warp_to_slot(1_101);
     try_ix(&mut w.svm, open_round_ix(service.pubkey(), fp, 5, 1, sha256(&[2u8; 32])), &service).unwrap();
     at_slot(&mut w.svm, 1_140, &recent(1_140, &[]));
     try_ix(&mut w.svm, reveal_ix(round_address(fp), service.pubkey(), [2u8; 32]), &service).unwrap();
     let q = sha256(&canonical_question(&VECTOR_NONCE));
-    try_ix(&mut w.svm, commit_reading_ix(service.pubkey(), round_address(fp), "https://anything.example/x", q), &service).unwrap();
+    try_with(&mut w.svm, |s| commit_reading_ix(s, service.pubkey(), round_address(fp), "https://anything.example/x", q), &service).unwrap();
     let copy = reading_address(round_address(fp), "https://anything.example/x");
     w.svm.warp_to_slot(1_141);
     try_ix(&mut w.svm, reveal_reading_ix(service.pubkey(), copy, VECTOR_NONCE, [3u8; 32], 2), &service).unwrap();
@@ -129,7 +133,7 @@ fn only_the_fair_question_for_the_nonce_can_be_revealed() {
     let d = w.depositor.insecure_clone();
     let mut unfair = canonical_question(&VECTOR_NONCE);
     unfair.push(b' ');
-    try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, SERVICE, sha256(&unfair)), &d).unwrap();
+    try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, SERVICE, sha256(&unfair)), &d).unwrap();
     w.svm.warp_to_slot(1_101);
     let reading = reading_address(round, SERVICE);
     let err = try_ix(&mut w.svm, reveal_reading_ix(d.pubkey(), reading, VECTOR_NONCE, [3u8; 32], 1), &d).unwrap_err();
@@ -221,27 +225,27 @@ fn one_reading_per_service_per_round() {
     let (mut w, round) = drawn();
     commit(&mut w, round, SERVICE, VECTOR_NONCE);
     let d = w.depositor.insecure_clone();
-    let err = try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, SERVICE, [1u8; 32]), &d).unwrap_err();
+    let err = try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, SERVICE, [1u8; 32]), &d).unwrap_err();
     assert!(err.contains("already in use"), "{err}");
 }
 
 #[test]
-fn only_the_rounds_opener_reads_for_now() {
+fn only_a_member_reads() {
     let (mut w, round) = drawn();
     let (stranger, _) = newcomer(&mut w.svm, 0);
     let q = sha256(&canonical_question(&VECTOR_NONCE));
-    let err = try_ix(&mut w.svm, commit_reading_ix(stranger.pubkey(), round, SERVICE, q), &stranger).unwrap_err();
+    let err = try_with(&mut w.svm, |s| commit_reading_ix(s, stranger.pubkey(), round, SERVICE, q), &stranger).unwrap_err();
     assert!(err.contains("NotTheReader"), "{err}");
 }
 
 #[test]
 fn a_round_not_yet_drawn_cannot_be_read() {
-    let mut w = world();
+    let mut w = world_with_member();
     let d = w.depositor.insecure_clone();
     at_slot(&mut w.svm, 1_000, &recent(1_000, &[]));
     try_ix(&mut w.svm, open_round_ix(d.pubkey(), [78u8; 32], 10, 2, sha256(&[1u8; 32])), &d).unwrap();
     let q = sha256(&canonical_question(&VECTOR_NONCE));
-    let err = try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round_address([78u8; 32]), SERVICE, q), &d).unwrap_err();
+    let err = try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round_address([78u8; 32]), SERVICE, q), &d).unwrap_err();
     assert!(err.contains("RoundNotDrawn"), "{err}");
 }
 
@@ -252,13 +256,13 @@ fn the_service_must_be_a_clean_url_matching_its_hash() {
     let q = sha256(&canonical_question(&VECTOR_NONCE));
     let long = format!("https://x.example/{}", "a".repeat(300));
     for bad in ["", "https://x.example/a b", long.as_str()] {
-        let err = try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, bad, q), &d).unwrap_err();
+        let err = try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, bad, q), &d).unwrap_err();
         assert!(err.contains("BadEndpoint"), "{bad:?}: {err}");
     }
     // The hash that places the reading must be the hash of the service named.
     let other = "https://other.example/x";
-    let mut ix = commit_reading_ix(d.pubkey(), round, SERVICE, q);
-    ix.accounts[2].pubkey = reading_address(round, other);
+    let mut ix = commit_reading_ix(&w.svm, d.pubkey(), round, SERVICE, q);
+    ix.accounts[3].pubkey = reading_address(round, other);
     ix.data = anchor_lang::InstructionData::data(&sasona::instruction::CommitReading {
         endpoint_hash: sha256(other.as_bytes()),
         endpoint: SERVICE.to_string(),

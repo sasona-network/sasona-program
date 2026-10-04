@@ -413,6 +413,7 @@ pub fn open_round_ix(opener: Address, fingerprint: [u8; 32], size: u32, count: u
     let accounts = sasona::accounts::OpenRound {
         opener: key(opener),
         round: key(round_address(fingerprint)),
+        members: key(members_address()),
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
@@ -472,21 +473,29 @@ pub fn reading_address(round: Address, endpoint: &str) -> Address {
     pda(&[sasona::READING_SEED, round.as_ref(), &sha256(endpoint.as_bytes())])
 }
 
-pub fn commit_reading_ix(reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32]) -> Instruction {
+/// A commitment by `reader`, with the membership the draw gives them and the
+/// memberships it passed over before theirs. If they were not drawn, it names
+/// a membership of theirs anyway, or the drawn one if they hold none, so the
+/// program is what refuses it.
+pub fn commit_reading_ix(svm: &LiteSVM, reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32]) -> Instruction {
+    let (member, skipped) = reader_accounts(svm, reader, round, endpoint, None);
     let accounts = sasona::accounts::CommitReading {
         reader: key(reader),
         round: key(round),
+        member: key(member),
         reading: key(reading_address(round, endpoint)),
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
+    let mut accounts = metas(accounts);
+    accounts.extend(skipped.into_iter().map(|a| AccountMeta::new_readonly(a, false)));
     let data = sasona::instruction::CommitReading {
         endpoint_hash: sha256(endpoint.as_bytes()),
         endpoint: endpoint.to_string(),
         question_hash,
     }
     .data();
-    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+    Instruction { program_id: program_id(), accounts, data }
 }
 
 pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8) -> Instruction {
@@ -501,24 +510,32 @@ pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], rep
     Instruction { program_id: program_id(), accounts: metas(accounts), data }
 }
 
-pub fn commit_second_ix(reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32], first: Address) -> Instruction {
+pub fn commit_second_ix(svm: &LiteSVM, reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32], first: Address) -> Instruction {
     let reading = reading_address(round, endpoint);
+    let first_reader = svm
+        .get_account(&first)
+        .and_then(|a| sasona::Reading::try_deserialize(&mut a.data.as_slice()).ok())
+        .map(|r| addr(r.reader));
+    let (member, skipped) = reader_accounts(svm, reader, round, endpoint, first_reader);
     let accounts = sasona::accounts::CommitSecondReading {
         reader: key(reader),
         round: key(round),
+        member: key(member),
         reading: key(reading),
         first: key(first),
         pair: key(pda(&[sasona::PAIR_SEED, reading.as_ref()])),
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
+    let mut accounts = metas(accounts);
+    accounts.extend(skipped.into_iter().map(|a| AccountMeta::new_readonly(a, false)));
     let data = sasona::instruction::CommitSecondReading {
         endpoint_hash: sha256(endpoint.as_bytes()),
         endpoint: endpoint.to_string(),
         question_hash,
     }
     .data();
-    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+    Instruction { program_id: program_id(), accounts, data }
 }
 
 pub fn settle_pair_ix(first: Address, second: Address) -> Instruction {
@@ -534,4 +551,216 @@ pub fn settle_pair_ix(first: Address, second: Address) -> Instruction {
 pub fn lapsed_ix(reading: Address) -> Instruction {
     let accounts = sasona::accounts::MarkLapsed { reading: key(reading) }.to_account_metas(None);
     Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::MarkLapsed {}.data() }
+}
+
+/// Build an instruction from the current state, then send it.
+pub fn try_with(svm: &mut LiteSVM, make: impl FnOnce(&LiteSVM) -> Instruction, who: &Keypair) -> Result<(), String> {
+    let ix = make(svm);
+    try_ix(svm, ix, who)
+}
+
+// ------------------------------------------------------------------ members
+
+pub fn members_address() -> Address {
+    pda(&[sasona::MEMBERS_SEED])
+}
+
+pub fn member_address(number: u32) -> Address {
+    pda(&[sasona::MEMBER_SEED, &number.to_le_bytes()])
+}
+
+pub fn member(svm: &LiteSVM, number: u32) -> sasona::Member {
+    read(svm, member_address(number))
+}
+
+pub fn member_count(svm: &LiteSVM) -> u32 {
+    svm.get_account(&members_address())
+        .and_then(|a| sasona::Members::try_deserialize(&mut a.data.as_slice()).ok())
+        .map(|m| m.count)
+        .unwrap_or(0)
+}
+
+pub fn join_members_ix(owner: Address, number: u32) -> Instruction {
+    let coin = pda(&[COIN_SEED]);
+    let accounts = sasona::accounts::JoinMembers {
+        owner: key(owner),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(coin),
+        owner_coin: key(ata(owner, coin)),
+        members: key(members_address()),
+        member: key(member_address(number)),
+        stakes: key(pda(&[sasona::STAKES_SEED])),
+        held: key(pda(&[sasona::HELD_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::JoinMembers {}.data() }
+}
+
+/// Take a membership for `who`, who must hold the coins. Returns its number.
+pub fn join(svm: &mut LiteSVM, who: &Keypair) -> u32 {
+    let number = member_count(svm) + 1;
+    try_ix(svm, join_members_ix(who.pubkey(), number), who).expect("join");
+    number
+}
+
+/// Someone new who deposited $100, which leaves them coins for a stake, and
+/// took a membership.
+pub fn new_member(svm: &mut LiteSVM) -> (Keypair, u32) {
+    let (k, usd) = newcomer(svm, 100);
+    try_deposit(svm, &k, usd, 100 * DOLLAR).expect("deposit");
+    let n = join(svm, &k);
+    (k, n)
+}
+
+/// The pool opened by the depositor, who holds membership 1.
+pub fn world_with_member() -> World {
+    let mut w = world();
+    open(&mut w, 1_000 * DOLLAR);
+    let d = w.depositor.insecure_clone();
+    join(&mut w.svm, &d);
+    w
+}
+
+pub fn ask_to_leave_ix(owner: Address, number: u32) -> Instruction {
+    let accounts = sasona::accounts::AskToLeave { owner: key(owner), member: key(member_address(number)) }.to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AskToLeave {}.data() }
+}
+
+pub fn leave_ix(owner: Address, number: u32) -> Instruction {
+    let coin = pda(&[COIN_SEED]);
+    let accounts = sasona::accounts::Leave {
+        owner: key(owner),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(coin),
+        member: key(member_address(number)),
+        stakes: key(pda(&[sasona::STAKES_SEED])),
+        owner_coin: key(ata(owner, coin)),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Leave {}.data() }
+}
+
+/// SPEC.md 4.3, followed against the accounts: the membership drawn for
+/// `endpoint` in `round`, and those passed over before it.
+pub fn drawn_for(svm: &LiteSVM, round: Address, endpoint: &str, first_reader: Option<Address>) -> (Option<u32>, Vec<u32>) {
+    let r: sasona::Round = read(svm, round);
+    let mut skipped = vec![];
+    if r.members == 0 {
+        return (None, skipped);
+    }
+    let h = sha256(endpoint.as_bytes());
+    for a in 0..sasona::MAX_READER_ATTEMPTS {
+        let k = sasona::reader_number(&r.final_seed, &h, a, r.members);
+        let m = member(svm, k);
+        if m.state == sasona::MEMBER_ACTIVE && Some(addr(m.owner)) != first_reader {
+            return (Some(k), skipped);
+        }
+        skipped.push(k);
+    }
+    (None, skipped)
+}
+
+fn reader_accounts(svm: &LiteSVM, reader: Address, round: Address, endpoint: &str, first_reader: Option<Address>) -> (Address, Vec<Address>) {
+    let (drawn, skipped) = drawn_for(svm, round, endpoint, first_reader);
+    if let Some(k) = drawn {
+        if addr(member(svm, k).owner) == reader {
+            return (member_address(k), skipped.into_iter().map(member_address).collect());
+        }
+    }
+    let own = (1..=member_count(svm)).find(|&n| addr(member(svm, n).owner) == reader);
+    (member_address(own.or(drawn).unwrap_or(1)), vec![])
+}
+
+// --------------------------------------------------------------- challenges
+
+pub fn challenge_address(reading: Address) -> Address {
+    pda(&[sasona::CHALLENGE_SEED, reading.as_ref()])
+}
+
+pub fn evidence_address(reading: Address) -> Address {
+    pda(&[sasona::EVIDENCE_SEED, reading.as_ref()])
+}
+
+fn member_of(svm: &LiteSVM, reading: Address) -> Address {
+    let r: sasona::Reading = read(svm, reading);
+    member_address(r.member)
+}
+
+pub fn challenge_ix(svm: &LiteSVM, challenger: Address, reading: Address) -> Instruction {
+    let accounts = sasona::accounts::ChallengeReading {
+        challenger: key(challenger),
+        reading: key(reading),
+        member: key(member_of(svm, reading)),
+        challenge: key(challenge_address(reading)),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Challenge {}.data() }
+}
+
+pub fn open_evidence_ix(reader: Address, reading: Address, len: u32) -> Instruction {
+    let accounts = sasona::accounts::OpenEvidence {
+        reader: key(reader),
+        reading: key(reading),
+        evidence: key(evidence_address(reading)),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::OpenEvidence { len }.data() }
+}
+
+pub fn write_evidence_ix(reader: Address, reading: Address, offset: u32, bytes: &[u8]) -> Instruction {
+    let accounts = sasona::accounts::WriteEvidence {
+        reader: key(reader),
+        reading: key(reading),
+        evidence: key(evidence_address(reading)),
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::WriteEvidence { offset, bytes: bytes.to_vec() }.data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+/// Put a whole reply on chain, in pieces small enough for a transaction.
+pub fn put_evidence(svm: &mut LiteSVM, reader: &Keypair, reading: Address, reply: &[u8]) -> Result<(), String> {
+    try_ix(svm, open_evidence_ix(reader.pubkey(), reading, reply.len() as u32), reader)?;
+    for (i, chunk) in reply.chunks(800).enumerate() {
+        try_ix(svm, write_evidence_ix(reader.pubkey(), reading, (i * 800) as u32, chunk), reader)?;
+    }
+    Ok(())
+}
+
+pub fn answer_ix(svm: &LiteSVM, reading: Address, nonce: [u8; 16]) -> Instruction {
+    let r: sasona::Reading = read(svm, reading);
+    let accounts = sasona::accounts::AnswerChallenge {
+        challenge: key(challenge_address(reading)),
+        reading: key(reading),
+        evidence: key(evidence_address(reading)),
+        used_nonce: key(pda(&[sasona::NONCE_SEED, &nonce])),
+        member: key(member_address(r.member)),
+        reader: r.reader,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AnswerChallenge { nonce }.data() }
+}
+
+pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
+    let c: sasona::Challenge = read(svm, challenge_address(reading));
+    let coin = pda(&[COIN_SEED]);
+    let accounts = sasona::accounts::UpholdChallenge {
+        challenge: key(challenge_address(reading)),
+        reading: key(reading),
+        member: key(member_of(svm, reading)),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(coin),
+        stakes: key(pda(&[sasona::STAKES_SEED])),
+        held: key(pda(&[sasona::HELD_SEED])),
+        challenger: c.challenger,
+        challenger_coin: key(ata(addr(c.challenger), coin)),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::UpholdChallenge {}.data() }
 }
