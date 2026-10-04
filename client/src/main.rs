@@ -6,7 +6,6 @@
 //!     sasona settle --keypair <path>
 //!     sasona depth <dollars> --keypair <path>
 //!     sasona join <owner> --keypair <path>
-//!     sasona claim <dollars> <to dollar account> --keypair <judge key>
 //!     sasona ask-back <shares> --keypair <path>
 //!     sasona release --keypair <path>
 //!     sasona open-round <candidates file> <count> --keypair <path>
@@ -24,6 +23,17 @@
 //!     sasona answer <reading> <nonce hex> --keypair <path>
 //!     sasona uphold <reading> --keypair <path>
 //!     sasona quote <reading> <basis points, 0 to withdraw> --keypair <path>
+//!     sasona buy <reading> <purchase id> <dollars> --keypair <path>
+//!     sasona charge-back <purchase> --keypair <path>
+//!     sasona record-draw <purchase> --keypair <path>
+//!     sasona commit-replay <purchase> <service url> <question hash hex> --keypair <path>
+//!     sasona reveal-replay <purchase> <nonce hex> <reply hash hex> <verdict> --keypair <path>
+//!     sasona pass-draw <purchase> --keypair <path>
+//!     sasona settle-chargeback <purchase> --keypair <path>
+//!     sasona repay-cover <purchase> --keypair <path>
+//!
+//! reveal-reading and reveal-replay take [--pay-to <address>]: where the
+//! service asked to be paid (sasona-protocol SPEC.md 7.1).
 //!
 //! commit-reading and commit-second work out the draw for the service
 //! (sasona-protocol SPEC.md 4.3) and send the keypair's membership with the
@@ -45,7 +55,7 @@ use anchor_client::anchor_lang::prelude::AccountMeta;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
     NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
-    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
+    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, BOOK_SEED, CHARGEBACK_SEED, ESCROW_SEED, PURCHASE_SEED, SERVICE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -54,7 +64,6 @@ use solana_signer::Signer;
 const USAGE: &str = "usage: sasona <open|deposit|fee|depth> <dollars> --keypair <path>
        sasona settle|release --keypair <path>
        sasona join <owner> --keypair <path>
-       sasona claim <dollars> <to dollar account> --keypair <judge key> [--reference <text>]
        sasona ask-back <shares> --keypair <path>
        sasona open-round <candidates file> <count> | reveal-round <candidates file> | withheld <candidates file> --keypair <path>
        (all take [--url <rpc>])";
@@ -100,11 +109,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair_path = arg(&args, "--keypair").expect(USAGE);
     let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
@@ -160,6 +169,35 @@ fn main() {
         out
     };
     let reading_of = |reading: &Pubkey| -> sasona::Reading { program.account(*reading).expect("reading") };
+    let pay_to = || -> Pubkey { arg(&args, "--pay-to").map(|s| s.parse().expect("pay-to address")).unwrap_or_default() };
+    let chargeback_of = |purchase: &Pubkey| -> (Pubkey, sasona::Chargeback) {
+        let at = pda(&[CHARGEBACK_SEED, purchase.as_ref()]);
+        (at, program.account(at).expect("chargeback"))
+    };
+    let replay_pda = |chargeback: &Pubkey, draw: u8| pda(&[READING_SEED, chargeback.as_ref(), &[draw]]);
+    // SPEC.md 7.4: the seat drawn for a chargeback's current draw, and the
+    // seats passed over before it, once its entropy is recorded.
+    let replay_drawn = |c: &sasona::Chargeback| -> (Option<u32>, Vec<u32>) {
+        let mut skipped = vec![];
+        if c.draw_members == 0 {
+            return (None, skipped);
+        }
+        let seated = members_now().seated;
+        let declined = &c.declined[..c.counted_draws as usize];
+        for a in 0..sasona::MAX_READER_ATTEMPTS {
+            let k = sasona::reader_number(&c.seed, &c.service, a, c.draw_members);
+            if k > seated {
+                continue;
+            }
+            let s: sasona::Seat = program.account(seat_pda(k)).expect("seat");
+            if s.since >= c.draw_slot || s.owner == c.buyer || s.owner == c.quoter || declined.contains(&s.member) {
+                skipped.push(k);
+                continue;
+            }
+            return (Some(k), skipped);
+        }
+        (None, skipped)
+    };
 
     if command == "evidence" {
         // Several transactions: room for the reply, then the reply in pieces.
@@ -221,6 +259,7 @@ fn main() {
                 member: member_pda(number),
                 stakes: pda(&[STAKES_SEED]),
                 owner_coin: get_associated_token_address(&me, &coin),
+                book: pda(&[BOOK_SEED, &number.to_le_bytes()]),
                 token_program: anchor_spl::token::ID,
             })
             .args(sasona::instruction::Leave {})
@@ -263,13 +302,163 @@ fn main() {
                 pool: pda(&[POOL_SEED]),
                 coin_mint: coin,
                 stakes: pda(&[STAKES_SEED]),
-                held: pda(&[HELD_SEED]),
+                cover: pda(&[COVER_SEED]),
+                cover_vault: pda(&[COVER_VAULT_SEED]),
                 challenger: c.challenger,
                 challenger_coin: get_associated_token_address(&c.challenger, &coin),
                 token_program: anchor_spl::token::ID,
             })
             .accounts(unseat(r.member))
             .args(sasona::instruction::UpholdChallenge {})
+    } else if command == "buy" {
+        let reading: Pubkey = args[2].parse().expect("reading address");
+        let id: u64 = args[3].parse().expect("purchase id");
+        let price = (args[4].parse::<f64>().expect("dollars") * 1_000_000.0).round() as u64;
+        let r = reading_of(&reading);
+        let quoter: sasona::Member = program.account(member_pda(r.member)).expect("membership");
+        eprintln!("purchase {}", pda(&[PURCHASE_SEED, me.as_ref(), &id.to_le_bytes()]));
+        request
+            .accounts(sasona::accounts::Buy {
+                buyer: me,
+                buyer_usd: get_associated_token_address(&me, &USD_MINT),
+                usd_mint: USD_MINT,
+                pool: pda(&[POOL_SEED]),
+                reading,
+                quote: pda(&[QUOTE_SEED, reading.as_ref()]),
+                member: member_pda(r.member),
+                book: pda(&[BOOK_SEED, &r.member.to_le_bytes()]),
+                purchase: pda(&[PURCHASE_SEED, me.as_ref(), &id.to_le_bytes()]),
+                merchant_usd: get_associated_token_address(&r.pay_to, &USD_MINT),
+                quoter_usd: get_associated_token_address(&quoter.owner, &USD_MINT),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::Buy { id, price })
+    } else if command == "charge-back" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let pu: sasona::Purchase = program.account(purchase).expect("purchase");
+        request
+            .accounts(sasona::accounts::ChargeBack {
+                buyer: me,
+                buyer_usd: get_associated_token_address(&me, &USD_MINT),
+                usd_mint: USD_MINT,
+                pool: pda(&[POOL_SEED]),
+                purchase,
+                member: member_pda(pu.member),
+                members: pda(&[MEMBERS_SEED]),
+                service_terms: pda(&[SERVICE_SEED, &pu.service]),
+                chargeback: pda(&[CHARGEBACK_SEED, purchase.as_ref()]),
+                escrow: pda(&[ESCROW_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::ChargeBack {})
+    } else if command == "record-draw" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        request
+            .accounts(sasona::accounts::RecordDraw {
+                chargeback: pda(&[CHARGEBACK_SEED, purchase.as_ref()]),
+                slot_hashes: sasona::SLOT_HASHES_ID,
+            })
+            .args(sasona::instruction::RecordDraw {})
+    } else if command == "commit-replay" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let (at, c) = chargeback_of(&purchase);
+        assert!(c.seed != [0u8; 32], "record the draw first: sasona record-draw {purchase}");
+        let (drawn, skipped) = replay_drawn(&c);
+        let k = drawn.expect("no seat qualifies for this draw; pass it");
+        let s: sasona::Seat = program.account(seat_pda(k)).expect("seat");
+        assert_eq!(s.owner, me, "seat {k} was drawn to replay, and it is not yours");
+        eprintln!("drawn: seat {k}, membership {}", s.member);
+        request
+            .accounts(sasona::accounts::CommitReplay {
+                reader: me,
+                chargeback: at,
+                members: pda(&[MEMBERS_SEED]),
+                member: member_pda(s.member),
+                seat: seat_pda(k),
+                replay: replay_pda(&at, c.draw),
+                slot_hashes: sasona::SLOT_HASHES_ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .accounts(skipped.into_iter().map(|k| AccountMeta::new_readonly(seat_pda(k), false)).collect::<Vec<_>>())
+            .args(sasona::instruction::CommitReplay { endpoint: args[3].clone(), question_hash: unhex::<32>(&args[4]) })
+    } else if command == "reveal-replay" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let (at, c) = chargeback_of(&purchase);
+        let nonce = unhex::<16>(&args[3]);
+        request
+            .accounts(sasona::accounts::RevealReading {
+                reader: me,
+                reading: replay_pda(&at, c.draw),
+                used_nonce: pda(&[NONCE_SEED, &nonce]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::RevealReading {
+                nonce,
+                reply_hash: unhex::<32>(&args[4]),
+                verdict: args[5].parse().expect("verdict"),
+                pay_to: pay_to(),
+            })
+    } else if command == "pass-draw" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let (at, c) = chargeback_of(&purchase);
+        let (drawn, skipped) = if c.seed == [0u8; 32] { (None, vec![]) } else { replay_drawn(&c) };
+        let mut shown: Vec<AccountMeta> = drawn.iter().map(|&k| AccountMeta::new_readonly(seat_pda(k), false)).collect();
+        shown.extend(skipped.into_iter().map(|k| AccountMeta::new_readonly(seat_pda(k), false)));
+        request
+            .accounts(sasona::accounts::PassDraw {
+                chargeback: at,
+                members: pda(&[MEMBERS_SEED]),
+                replay: replay_pda(&at, c.draw),
+                slot_hashes: sasona::SLOT_HASHES_ID,
+            })
+            .accounts(shown)
+            .args(sasona::instruction::PassDraw { drawn_seat: drawn.unwrap_or(0) })
+    } else if command == "settle-chargeback" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let (at, c) = chargeback_of(&purchase);
+        let pu: sasona::Purchase = program.account(purchase).expect("purchase");
+        let replay = replay_pda(&at, c.draw);
+        let replayer = program
+            .account::<sasona::Reading>(replay)
+            .ok()
+            .filter(|r| r.state == sasona::READING_REVEALED)
+            .map(|r| get_associated_token_address(&r.reader, &USD_MINT));
+        request
+            .accounts(sasona::accounts::SettleChargeback {
+                chargeback: at,
+                purchase,
+                book: pda(&[BOOK_SEED, &pu.member.to_le_bytes()]),
+                replay,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                pool_usd: pda(&[POOL_USD_SEED]),
+                pool_coin: pda(&[POOL_COIN_SEED]),
+                fees: pda(&[FEES_SEED]),
+                cover: pda(&[COVER_SEED]),
+                cover_vault: pda(&[COVER_VAULT_SEED]),
+                escrow: pda(&[ESCROW_SEED]),
+                buyer_usd: get_associated_token_address(&c.buyer, &USD_MINT),
+                replayer_usd: replayer,
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::SettleChargeback {})
+    } else if command == "repay-cover" {
+        let purchase: Pubkey = args[2].parse().expect("purchase address");
+        let (at, c) = chargeback_of(&purchase);
+        request
+            .accounts(sasona::accounts::RepayCover {
+                chargeback: at,
+                book: pda(&[BOOK_SEED, &c.member.to_le_bytes()]),
+                member: member_pda(c.member),
+                pool: pda(&[POOL_SEED]),
+                stakes: pda(&[STAKES_SEED]),
+                cover: pda(&[COVER_SEED]),
+                cover_vault: pda(&[COVER_VAULT_SEED]),
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::RepayCover {})
     } else if command == "quote" {
         let reading: Pubkey = args[2].parse().expect("reading address");
         let rate: u16 = args[3].parse().expect("basis points");
@@ -348,28 +537,6 @@ fn main() {
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
             .args(sasona::instruction::JoinCover {})
-    } else if command == "claim" {
-        let to: Pubkey = args[3].parse().expect("the dollar account to pay");
-        let mut reference = [0u8; 32];
-        if let Some(r) = arg(&args, "--reference") {
-            let b = r.as_bytes();
-            reference[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
-        }
-        request
-            .accounts(sasona::accounts::Claim {
-                judge: me,
-                pool: pda(&[POOL_SEED]),
-                coin_mint: coin,
-                usd_mint: USD_MINT,
-                pool_usd: pda(&[POOL_USD_SEED]),
-                pool_coin: pda(&[POOL_COIN_SEED]),
-                fees: pda(&[FEES_SEED]),
-                cover: pda(&[COVER_SEED]),
-                cover_vault: pda(&[COVER_VAULT_SEED]),
-                claimant_usd: to,
-                token_program: anchor_spl::token::ID,
-            })
-            .args(sasona::instruction::Claim { dollars: amount, reference })
     } else if command == "ask-back" {
         let shares: u64 = args[2].parse().expect("shares");
         request
@@ -468,6 +635,7 @@ fn main() {
                 nonce,
                 reply_hash: unhex::<32>(&args[5]),
                 verdict: args[6].parse().expect("verdict"),
+                pay_to: pay_to(),
             })
     } else if command == "commit-second" {
         let round: Pubkey = args[2].parse().expect("re-read round address");
