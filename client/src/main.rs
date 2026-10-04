@@ -319,8 +319,8 @@ fn main() {
         let quoter: sasona::Member = program.account(member_pda(r.member)).expect("membership");
         // The rate the buyer accepts: the one standing now, unless named.
         let max_rate: u16 = match args.get(5) {
-            Some(a) => a.parse().expect("basis points"),
-            None => program.account::<sasona::Quote>(pda(&[QUOTE_SEED, reading.as_ref()])).expect("quote").rate,
+            Some(a) if !a.starts_with("--") => a.parse().expect("basis points"),
+            _ => program.account::<sasona::Quote>(pda(&[QUOTE_SEED, reading.as_ref()])).expect("quote").rate,
         };
         eprintln!("highest rate accepted {max_rate} bps");
         eprintln!("purchase {}", pda(&[PURCHASE_SEED, me.as_ref(), &id.to_le_bytes()]));
