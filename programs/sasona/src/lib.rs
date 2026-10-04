@@ -155,7 +155,7 @@ pub const SEAT_SEED: &[u8] = b"seat";
 pub const STAKES_SEED: &[u8] = b"stakes";
 /// NOTE, temporary: one flat stake, 10,000 coins, about two devnet dollars.
 /// A stake that deters has to grow with the traffic a service carries, which
-/// needs prices on chain (part 6). This number will change.
+/// needs purchases on chain (parts 7 and 8). This number will change.
 pub const MEMBER_STAKE: u64 = 10_000 * 1_000_000;
 pub const MEMBER_ACTIVE: u8 = 0;
 pub const MEMBER_LEAVING: u8 = 1;
@@ -175,8 +175,8 @@ pub const EVIDENCE_SEED: &[u8] = b"evidence";
 /// (part 7), which decides where they go.
 pub const HELD_SEED: &[u8] = b"held";
 /// NOTE, temporary: the bond and the challenger's tenth are devnet figures,
-/// set with the stake from what readings are worth once prices are on chain
-/// (part 6).
+/// set with the stake from what readings are worth once purchases are on
+/// chain (parts 7 and 8).
 pub const CHALLENGE_BOND_LAMPORTS: u64 = 100_000_000;
 /// SPEC.md 5.1: a reading can be challenged for 30 days after its reveal, the
 /// term a reading is current for, and a challenge answered for 7 days. Both
