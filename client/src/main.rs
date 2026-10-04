@@ -16,6 +16,17 @@
 //!     sasona reveal-reading <round> <service url> <nonce hex> <reply hash hex> <verdict> --keypair <path>
 //!     sasona commit-second <re-read round> <service url> <question hash hex> <first reading> --keypair <path>
 //!     sasona settle-pair <first reading> <second reading> --keypair <path>
+//!     sasona member-join --keypair <path>
+//!     sasona member-ask-leave <number> --keypair <path>
+//!     sasona member-leave <number> --keypair <path>
+//!     sasona challenge <reading> --keypair <path>
+//!     sasona evidence <reading> <reply file> --keypair <path>
+//!     sasona answer <reading> <nonce hex> --keypair <path>
+//!     sasona uphold <reading> --keypair <path>
+//!
+//! commit-reading and commit-second work out the draw for the service
+//! (sasona-protocol SPEC.md 4.3) and send the keypair's membership with the
+//! memberships passed over before it. They stop if the keypair was not drawn.
 //!
 //! A round is found by its list's fingerprint. open-round keeps the seed in
 //! `<keypair>.round-<fingerprint>.seed` until it is revealed; anyone who
@@ -29,9 +40,11 @@ use std::rc::Rc;
 use anchor_client::anchor_lang::prelude::Pubkey;
 use anchor_client::{Client, Cluster, CommitmentConfig};
 use anchor_spl::associated_token::get_associated_token_address;
+use anchor_client::anchor_lang::prelude::AccountMeta;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
     NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
+    CHALLENGE_SEED, EVIDENCE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, STAKES_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -86,11 +99,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair_path = arg(&args, "--keypair").expect(USAGE);
     let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
@@ -104,8 +117,132 @@ fn main() {
     let program = client.program(sasona::ID).expect("program client");
     let coin = pda(&[COIN_SEED]);
 
+    let member_pda = |n: u32| pda(&[MEMBER_SEED, &n.to_le_bytes()]);
+    // SPEC.md 4.3: this keypair's membership if it was drawn for the service,
+    // and the memberships passed over before it.
+    let drawn = |round: &Pubkey, endpoint_hash: &[u8; 32], first_reader: Option<Pubkey>| -> (Pubkey, Vec<AccountMeta>) {
+        let r: sasona::Round = program.account(*round).expect("round");
+        assert!(r.members > 0, "nobody was a member when this round was opened");
+        let mut skipped = vec![];
+        for a in 0..sasona::MAX_READER_ATTEMPTS {
+            let k = sasona::reader_number(&r.final_seed, endpoint_hash, a, r.members);
+            let m: sasona::Member = program.account(member_pda(k)).expect("membership");
+            if m.state == sasona::MEMBER_ACTIVE && Some(m.owner) != first_reader {
+                assert_eq!(m.owner, me, "membership {k} was drawn for this service, and it is not yours");
+                eprintln!("drawn: membership {k}, after passing over {}", skipped.len());
+                return (member_pda(k), skipped);
+            }
+            skipped.push(AccountMeta::new_readonly(member_pda(k), false));
+        }
+        panic!("no membership qualified in {} attempts: nobody reads this service in this round", sasona::MAX_READER_ATTEMPTS);
+    };
+    let reading_of = |reading: &Pubkey| -> sasona::Reading { program.account(*reading).expect("reading") };
+
+    if command == "evidence" {
+        // Several transactions: room for the reply, then the reply in pieces.
+        let reading: Pubkey = args[2].parse().expect("reading address");
+        let reply = std::fs::read(&args[3]).expect("reply file");
+        let evidence = pda(&[EVIDENCE_SEED, reading.as_ref()]);
+        let mut last = program
+            .request()
+            .accounts(sasona::accounts::OpenEvidence { reader: me, reading, evidence, system_program: anchor_client::anchor_lang::system_program::ID })
+            .args(sasona::instruction::OpenEvidence { len: reply.len() as u32 })
+            .send()
+            .expect("open-evidence failed");
+        for (i, chunk) in reply.chunks(800).enumerate() {
+            last = program
+                .request()
+                .accounts(sasona::accounts::WriteEvidence { reader: me, reading, evidence })
+                .args(sasona::instruction::WriteEvidence { offset: (i * 800) as u32, bytes: chunk.to_vec() })
+                .send()
+                .expect("write-evidence failed");
+        }
+        println!("{last}");
+        return;
+    }
+
     let request = program.request();
-    let request = if command == "open" {
+    let request = if command == "member-join" {
+        let members: Option<sasona::Members> = program.account(pda(&[MEMBERS_SEED])).ok();
+        let number = members.map(|m| m.count).unwrap_or(0) + 1;
+        eprintln!("membership {number}");
+        request
+            .accounts(sasona::accounts::JoinMembers {
+                owner: me,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                owner_coin: get_associated_token_address(&me, &coin),
+                members: pda(&[MEMBERS_SEED]),
+                member: member_pda(number),
+                stakes: pda(&[STAKES_SEED]),
+                held: pda(&[HELD_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::JoinMembers {})
+    } else if command == "member-ask-leave" {
+        let number: u32 = args[2].parse().expect("membership number");
+        request
+            .accounts(sasona::accounts::AskToLeave { owner: me, member: member_pda(number) })
+            .args(sasona::instruction::AskToLeave {})
+    } else if command == "member-leave" {
+        let number: u32 = args[2].parse().expect("membership number");
+        request
+            .accounts(sasona::accounts::Leave {
+                owner: me,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                member: member_pda(number),
+                stakes: pda(&[STAKES_SEED]),
+                owner_coin: get_associated_token_address(&me, &coin),
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::Leave {})
+    } else if command == "challenge" {
+        let reading: Pubkey = args[2].parse().expect("reading address");
+        let r = reading_of(&reading);
+        request
+            .accounts(sasona::accounts::ChallengeReading {
+                challenger: me,
+                reading,
+                member: member_pda(r.member),
+                challenge: pda(&[CHALLENGE_SEED, reading.as_ref()]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::Challenge {})
+    } else if command == "answer" {
+        let reading: Pubkey = args[2].parse().expect("reading address");
+        let nonce = unhex::<16>(&args[3]);
+        let r = reading_of(&reading);
+        request
+            .accounts(sasona::accounts::AnswerChallenge {
+                challenge: pda(&[CHALLENGE_SEED, reading.as_ref()]),
+                reading,
+                evidence: pda(&[EVIDENCE_SEED, reading.as_ref()]),
+                used_nonce: pda(&[NONCE_SEED, &nonce]),
+                member: member_pda(r.member),
+                reader: r.reader,
+            })
+            .args(sasona::instruction::AnswerChallenge { nonce })
+    } else if command == "uphold" {
+        let reading: Pubkey = args[2].parse().expect("reading address");
+        let r = reading_of(&reading);
+        let c: sasona::Challenge = program.account(pda(&[CHALLENGE_SEED, reading.as_ref()])).expect("challenge");
+        request
+            .accounts(sasona::accounts::UpholdChallenge {
+                challenge: pda(&[CHALLENGE_SEED, reading.as_ref()]),
+                reading,
+                member: member_pda(r.member),
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                stakes: pda(&[STAKES_SEED]),
+                held: pda(&[HELD_SEED]),
+                challenger: c.challenger,
+                challenger_coin: get_associated_token_address(&c.challenger, &coin),
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::UpholdChallenge {})
+    } else if command == "open" {
         request
             .accounts(sasona::accounts::Open {
                 depositor: me,
@@ -231,6 +368,7 @@ fn main() {
         eprintln!("round {} over {size} candidates, {count} picks", pda(&[ROUND_SEED, &fingerprint]));
         request
             .accounts(sasona::accounts::OpenRound {
+                members: pda(&[MEMBERS_SEED]),
                 opener: me,
                 round: pda(&[ROUND_SEED, &fingerprint]),
                 system_program: anchor_client::anchor_lang::system_program::ID,
@@ -261,13 +399,16 @@ fn main() {
         let round: Pubkey = args[2].parse().expect("round address");
         let endpoint = args[3].clone();
         let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
+        let (member, skipped) = drawn(&round, &endpoint_hash, None);
         request
             .accounts(sasona::accounts::CommitReading {
                 reader: me,
                 round,
+                member,
                 reading: pda(&[READING_SEED, round.as_ref(), &endpoint_hash]),
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
+            .accounts(skipped)
             .args(sasona::instruction::CommitReading { endpoint_hash, endpoint, question_hash: unhex::<32>(&args[4]) })
     } else if command == "reveal-reading" {
         let round: Pubkey = args[2].parse().expect("round address");
@@ -290,15 +431,19 @@ fn main() {
         let endpoint = args[3].clone();
         let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
         let reading = pda(&[READING_SEED, round.as_ref(), &endpoint_hash]);
+        let first: Pubkey = args[5].parse().expect("first reading address");
+        let (member, skipped) = drawn(&round, &endpoint_hash, Some(reading_of(&first).reader));
         request
             .accounts(sasona::accounts::CommitSecondReading {
                 reader: me,
                 round,
+                member,
                 reading,
-                first: args[5].parse().expect("first reading address"),
+                first,
                 pair: pda(&[PAIR_SEED, reading.as_ref()]),
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
+            .accounts(skipped)
             .args(sasona::instruction::CommitSecondReading { endpoint_hash, endpoint, question_hash: unhex::<32>(&args[4]) })
     } else if command == "settle-pair" {
         let second: Pubkey = args[3].parse().expect("second reading address");
