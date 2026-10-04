@@ -625,3 +625,34 @@ fn a_paid_chargeback_also_starts_the_thirty_days() {
     charge(&mut m, &buyer, three).unwrap();
     assert!(chargeback(&m.w.svm, three).deposit > 0);
 }
+
+#[test]
+fn an_upheld_challenge_pays_the_debt_first_and_the_challenger_a_tenth_of_the_rest() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    replay(&mut m, purchase, 2);
+    settle(&mut m, purchase).unwrap();
+    let owed = chargeback(&m.w.svm, purchase).owed_coins;
+    assert!(owed > 0);
+    let c = challenger(&mut m.w.svm);
+    let reading = m.reading;
+    try_with(&mut m.w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+    days_pass(&mut m.w.svm, 8);
+    let coins_before = coins(&m.w.svm, c.pubkey());
+    let cover_before = cover(&m.w.svm).coins;
+    try_with(&mut m.w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    let reward = (MEMBER_STAKE - owed) / 10;
+    assert_eq!(coins(&m.w.svm, c.pubkey()), coins_before + reward);
+    assert_eq!(cover(&m.w.svm).coins, cover_before + MEMBER_STAKE - reward);
+    // The stake already went to the cover, so repaying takes nothing more and
+    // ends the debt.
+    let r: sasona::Reading = read(&m.w.svm, m.reading);
+    let now = m.w.svm.get_sysvar::<solana_clock::Clock>().unix_timestamp;
+    days_pass(&mut m.w.svm, (r.reveal_time + CHALLENGE_WINDOW_SECONDS - now) / 86_400 + 1);
+    let cover_before = cover(&m.w.svm).coins;
+    try_with(&mut m.w.svm, |s| repay_cover_ix(s, purchase), &c).unwrap();
+    assert_eq!(cover(&m.w.svm).coins, cover_before);
+    assert_eq!((book(&m.w.svm, 1).owed_coins, chargeback(&m.w.svm, purchase).owed_coins), (0, 0));
+}

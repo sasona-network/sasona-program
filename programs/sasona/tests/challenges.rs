@@ -29,10 +29,6 @@ fn lamports(svm: &LiteSVM, at: Address) -> u64 {
     svm.get_account(&at).map(|a| a.lamports).unwrap_or(0)
 }
 
-fn coins(svm: &LiteSVM, who: Address) -> u64 {
-    token_balance(svm, ata(who, pda(&[COIN_SEED])))
-}
-
 /// Membership 1 reads SERVICE and reveals `reply`'s hash with `verdict`, at
 /// slot 1,101. Returns the reading.
 fn revealed(w: &mut World, reply: &[u8], verdict: u8) -> Address {
@@ -53,12 +49,6 @@ fn revealed(w: &mut World, reply: &[u8], verdict: u8) -> Address {
 }
 
 /// Someone who holds coins, so a tenth of a stake has somewhere to go.
-fn challenger(svm: &mut LiteSVM) -> Keypair {
-    let (k, usd) = newcomer(svm, 10);
-    try_deposit(svm, &k, usd, 10 * DOLLAR).unwrap();
-    k
-}
-
 #[test]
 fn the_program_judges_replies_as_the_protocol_does() {
     // Every reply in sasona-protocol's vectors/question.json, 0.3.0.

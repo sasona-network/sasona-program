@@ -1140,3 +1140,15 @@ pub fn pay_back(w: &mut World, dollars: u64) -> Result<Address, String> {
     try_ix(&mut w.svm, ix, &buyer)?;
     Ok(usd_acc)
 }
+
+/// Coin held by `who`.
+pub fn coins(svm: &LiteSVM, who: Address) -> u64 {
+    token_balance(svm, ata(who, pda(&[sasona::COIN_SEED])))
+}
+
+/// Someone with coin to put up a challenge bond from.
+pub fn challenger(svm: &mut LiteSVM) -> Keypair {
+    let (k, usd) = newcomer(svm, 10);
+    try_deposit(svm, &k, usd, 10 * DOLLAR).unwrap();
+    k
+}
