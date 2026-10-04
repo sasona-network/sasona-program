@@ -23,6 +23,15 @@ BUFFER=$(solana-keygen pubkey "$BUFFER_KEY")
 SIZE=$(stat -c %s "$SO")
 echo "binary  $SIZE bytes, sha256 $(sha256sum "$SO" | cut -c1-16)"
 
+# A buffer left by a run for a binary of another size would keep that
+# binary's tail, and its last chunk would never match. Close it, getting its
+# rent back, and start a new one.
+BLEN=$(solana program show -u "$URL" "$BUFFER" 2>/dev/null | awk '/Data Length/ {print $3}')
+if [ -n "$BLEN" ] && [ "$BLEN" != "$SIZE" ]; then
+    echo "buffer holds $BLEN bytes, not $SIZE; closing it"
+    solana program close -u "$URL" --keypair "$KEYPAIR" --authority "$KEYPAIR" "$BUFFER" || exit 1
+fi
+
 # The program account must be large enough for the new binary.
 HAVE=$(solana program show -u "$URL" "$PROGRAM" | awk '/Data Length/ {print $3}')
 if [ "$HAVE" -lt "$SIZE" ]; then
