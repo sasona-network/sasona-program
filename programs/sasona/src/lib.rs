@@ -106,6 +106,28 @@ pub const NOTICE_SECONDS: i64 = 45 * 24 * 60 * 60;
 /// the count overflows and nobody could deposit again.
 pub const MAX_SHARES_PER_COIN: u64 = 1_000;
 
+/// Rounds draw which services get tested; sasona-protocol SPEC.md section 1
+/// is the rule. The program holds the commitment, waits for a slot that did
+/// not exist when the round was committed, and fixes the final seed.
+pub const ROUND_SEED: &[u8] = b"round";
+pub const DRAW_DOMAIN: &[u8] = b"sasona/draw/v1";
+/// The entropy comes from a slot at least this far after the commitment.
+pub const ENTROPY_DELAY_SLOTS: u64 = 32;
+pub const SLOT_HASHES_ID: Pubkey = pubkey!("SysvarS1otHashes111111111111111111111111111");
+
+pub const ROUND_COMMITTED: u8 = 0;
+pub const ROUND_DRAWN: u8 = 1;
+pub const ROUND_WITHHELD: u8 = 2;
+
+/// The most candidates a round may hold, so the draw's attempt counter fits
+/// in four bytes.
+pub const MAX_ROUND_CANDIDATES: u32 = 65_536;
+
+/// Put up when a round is opened and returned when its seed is revealed.
+/// Lost if the seed is withheld, so walking away from a draw you dislike is
+/// not free. 0.1 SOL.
+pub const ROUND_BOND_LAMPORTS: u64 = 100_000_000;
+
 /// NOTE, temporary: who may approve a claim. Deciding claims belongs to
 /// members drawn at random, which is part 7 of the roadmap. Until then it is
 /// the key that can already upgrade this program, so nothing new is trusted.
@@ -372,6 +394,93 @@ pub mod sasona {
         a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
 
         emit!(DepthAdded { giver: a.giver.key(), amount });
+        Ok(())
+    }
+
+    /// Commit a round: the list of services by its fingerprint and size, how
+    /// many will be drawn, and the hash of a seed only the opener knows.
+    ///
+    /// The round's address comes from the list's fingerprint, so a list can
+    /// be drawn once. Otherwise an opener could open several rounds for the
+    /// same list, reveal them all and keep whichever result they liked.
+    pub fn open_round(
+        ctx: Context<OpenRound>,
+        pool_fingerprint: [u8; 32],
+        pool_size: u32,
+        count: u16,
+        seed_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            pool_size > 0 && pool_size <= MAX_ROUND_CANDIDATES && count > 0 && count as u32 <= pool_size,
+            SasonaError::BadRound
+        );
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.opener.to_account_info(),
+                    to: ctx.accounts.round.to_account_info(),
+                },
+            ),
+            ROUND_BOND_LAMPORTS,
+        )?;
+        let r = &mut ctx.accounts.round;
+        r.opener = ctx.accounts.opener.key();
+        r.pool_fingerprint = pool_fingerprint;
+        r.pool_size = pool_size;
+        r.count = count;
+        r.seed_hash = seed_hash;
+        r.commit_slot = Clock::get()?.slot;
+        r.state = ROUND_COMMITTED;
+        r.bump = ctx.bumps.round;
+        emit!(RoundOpened { round: r.key(), opener: r.opener, pool_fingerprint, pool_size, count, commit_slot: r.commit_slot });
+        Ok(())
+    }
+
+    /// Reveal a round's seed and fix its final seed.
+    ///
+    /// The entropy is the hash of the earliest slot at or after the target
+    /// slot, read from the SlotHashes sysvar. It can be read only while
+    /// SlotHashes still reaches back that far, a few minutes. Anyone holding
+    /// the seed may reveal it.
+    pub fn reveal_round(ctx: Context<RevealRound>, seed: [u8; 32]) -> Result<()> {
+        let r = &mut ctx.accounts.round;
+        require!(r.state == ROUND_COMMITTED, SasonaError::RoundNotOpen);
+        require!(solana_sha256_hasher::hashv(&[&seed]).to_bytes() == r.seed_hash, SasonaError::WrongSeed);
+
+        let target = r.commit_slot + ENTROPY_DELAY_SLOTS;
+        let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+        let (entropy_slot, entropy) = match entropy_for(&data, target)? {
+            Entropy::Found(slot, hash) => (slot, hash),
+            Entropy::TooEarly => return err!(SasonaError::TooEarly),
+            Entropy::Gone => return err!(SasonaError::TooLate),
+        };
+
+        r.seed = seed;
+        r.entropy_slot = entropy_slot;
+        r.entropy = entropy;
+        r.final_seed = solana_sha256_hasher::hashv(&[DRAW_DOMAIN, &seed, &entropy]).to_bytes();
+        r.state = ROUND_DRAWN;
+
+        // The bond goes back to the opener. The round keeps its rent and stays.
+        let round_info = ctx.accounts.round.to_account_info();
+        **round_info.try_borrow_mut_lamports()? -= ROUND_BOND_LAMPORTS;
+        **ctx.accounts.opener.to_account_info().try_borrow_mut_lamports()? += ROUND_BOND_LAMPORTS;
+        let r = &ctx.accounts.round;
+        emit!(RoundDrawn { round: r.key(), entropy_slot, final_seed: r.final_seed });
+        Ok(())
+    }
+
+    /// Mark a round whose seed was never revealed while it still could be.
+    /// It can never be drawn after this, and the record stays.
+    pub fn mark_withheld(ctx: Context<MarkWithheld>) -> Result<()> {
+        let r = &mut ctx.accounts.round;
+        require!(r.state == ROUND_COMMITTED, SasonaError::RoundNotOpen);
+        let target = r.commit_slot + ENTROPY_DELAY_SLOTS;
+        let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+        require!(matches!(entropy_for(&data, target)?, Entropy::Gone), SasonaError::NotWithheldYet);
+        r.state = ROUND_WITHHELD;
+        emit!(RoundWithheld { round: r.key() });
         Ok(())
     }
 
@@ -888,6 +997,43 @@ pub struct AddDepth<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(pool_fingerprint: [u8; 32])]
+pub struct OpenRound<'info> {
+    #[account(mut)]
+    pub opener: Signer<'info>,
+
+    #[account(init, payer = opener, space = 8 + Round::INIT_SPACE,
+              seeds = [ROUND_SEED, pool_fingerprint.as_ref()], bump)]
+    pub round: Account<'info, Round>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RevealRound<'info> {
+    #[account(mut, seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
+    pub round: Account<'info, Round>,
+
+    /// CHECK: the round's opener, who gets the bond back.
+    #[account(mut, address = round.opener)]
+    pub opener: UncheckedAccount<'info>,
+
+    /// CHECK: the SlotHashes sysvar, by address; read as raw bytes.
+    #[account(address = SLOT_HASHES_ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct MarkWithheld<'info> {
+    #[account(mut, seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
+    pub round: Account<'info, Round>,
+
+    /// CHECK: the SlotHashes sysvar, by address; read as raw bytes.
+    #[account(address = SLOT_HASHES_ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct JoinCover<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
@@ -1087,6 +1233,65 @@ impl Cover {
     }
 }
 
+/// A draw's commitment, and once revealed, its seed and the entropy it was
+/// mixed with. Kept for good, so anyone can re-run the draw.
+#[account]
+#[derive(InitSpace)]
+pub struct Round {
+    pub opener: Pubkey,
+    pub pool_fingerprint: [u8; 32],
+    pub pool_size: u32,
+    pub count: u16,
+    pub seed_hash: [u8; 32],
+    pub commit_slot: u64,
+    pub state: u8,
+    pub seed: [u8; 32],
+    pub entropy_slot: u64,
+    pub entropy: [u8; 32],
+    pub final_seed: [u8; 32],
+    pub bump: u8,
+}
+
+pub enum Entropy {
+    Found(u64, [u8; 32]),
+    TooEarly,
+    Gone,
+}
+
+/// Find the hash of the earliest slot at or after `target` in the raw
+/// SlotHashes data: a u64 count, then (u64 slot, 32-byte hash) entries,
+/// newest first. `Gone` once the oldest entry is later than `target`, which
+/// is when the window to reveal has closed.
+pub fn entropy_for(data: &[u8], target: u64) -> Result<Entropy> {
+    require!(data.len() >= 8, SasonaError::BadSlotHashes);
+    let n = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+    require!(n > 0 && data.len() >= 8 + n * 40, SasonaError::BadSlotHashes);
+    let entry = |i: usize| {
+        let at = 8 + i * 40;
+        let slot = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let hash: [u8; 32] = data[at + 8..at + 40].try_into().unwrap();
+        (slot, hash)
+    };
+    let (newest, _) = entry(0);
+    let (oldest, _) = entry(n - 1);
+    if newest < target {
+        return Ok(Entropy::TooEarly);
+    }
+    if oldest > target {
+        return Ok(Entropy::Gone);
+    }
+    // Newest first, so walk back to the last entry still at or after target.
+    let mut found = entry(0);
+    for i in 1..n {
+        let e = entry(i);
+        if e.0 < target {
+            break;
+        }
+        found = e;
+    }
+    Ok(Entropy::Found(found.0, found.1))
+}
+
 /// A guarantee its owner has asked for back. Still in the cover, and still
 /// paying claims, until the notice runs out.
 #[account]
@@ -1123,6 +1328,28 @@ pub struct FeePaid {
     pub reserve: u64,
     pub burned: u64,
     pub shared: u64,
+}
+
+#[event]
+pub struct RoundOpened {
+    pub round: Pubkey,
+    pub opener: Pubkey,
+    pub pool_fingerprint: [u8; 32],
+    pub pool_size: u32,
+    pub count: u16,
+    pub commit_slot: u64,
+}
+
+#[event]
+pub struct RoundDrawn {
+    pub round: Pubkey,
+    pub entropy_slot: u64,
+    pub final_seed: [u8; 32],
+}
+
+#[event]
+pub struct RoundWithheld {
+    pub round: Pubkey,
 }
 
 #[event]
@@ -1303,6 +1530,20 @@ pub enum SasonaError {
     CoverTooThin,
     #[msg("A claim cannot be paid into the pool's own accounts")]
     NotTheClaimant,
+    #[msg("A round needs at least one candidate, and no more picks than candidates")]
+    BadRound,
+    #[msg("This round is not waiting for its seed")]
+    RoundNotOpen,
+    #[msg("That seed does not match the round's commitment")]
+    WrongSeed,
+    #[msg("The slot whose hash the round needs does not exist yet")]
+    TooEarly,
+    #[msg("The slot whose hash the round needs is no longer in SlotHashes; the round can only be marked withheld")]
+    TooLate,
+    #[msg("The round can still be revealed")]
+    NotWithheldYet,
+    #[msg("The SlotHashes sysvar could not be read")]
+    BadSlotHashes,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

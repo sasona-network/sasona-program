@@ -404,3 +404,62 @@ pub fn days_pass(svm: &mut LiteSVM, days: i64) {
     c.unix_timestamp += days * 24 * 60 * 60;
     svm.set_sysvar(&c);
 }
+
+pub fn round_address(fingerprint: [u8; 32]) -> Address {
+    pda(&[sasona::ROUND_SEED, fingerprint.as_ref()])
+}
+
+pub fn open_round_ix(opener: Address, fingerprint: [u8; 32], size: u32, count: u16, seed_hash: [u8; 32]) -> Instruction {
+    let accounts = sasona::accounts::OpenRound {
+        opener: key(opener),
+        round: key(round_address(fingerprint)),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::OpenRound { pool_fingerprint: fingerprint, pool_size: size, count, seed_hash }.data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+pub fn reveal_ix(round: Address, opener: Address, seed: [u8; 32]) -> Instruction {
+    let accounts = sasona::accounts::RevealRound {
+        round: key(round),
+        opener: key(opener),
+        slot_hashes: sasona::SLOT_HASHES_ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::RevealRound { seed }.data() }
+}
+
+pub fn withheld_ix(round: Address) -> Instruction {
+    let accounts = sasona::accounts::MarkWithheld { round: key(round), slot_hashes: sasona::SLOT_HASHES_ID }
+        .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::MarkWithheld {}.data() }
+}
+
+/// Move the clock to `slot`, and make SlotHashes hold `entries`, newest
+/// first, as (slot, hash).
+pub fn at_slot(svm: &mut LiteSVM, slot: u64, entries: &[(u64, [u8; 32])]) {
+    svm.warp_to_slot(slot);
+    let mut data = (entries.len() as u64).to_le_bytes().to_vec();
+    for (s, h) in entries {
+        data.extend_from_slice(&s.to_le_bytes());
+        data.extend_from_slice(h);
+    }
+    let sysvar_owner = Address::from_str_const("Sysvar1111111111111111111111111111111111111");
+    svm.set_account(addr(sasona::SLOT_HASHES_ID), Account { lamports: 1_000_000_000, data, owner: sysvar_owner, executable: false, rent_epoch: 0 })
+        .unwrap();
+}
+
+/// The hash of a slot, made up for tests.
+pub fn slot_hash(slot: u64) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&slot.to_le_bytes());
+    h[31] = 0xAB;
+    h
+}
+
+/// SlotHashes as it stands at `now`: the 512 slots before it, newest first,
+/// leaving out any slot in `skipped`.
+pub fn recent(now: u64, skipped: &[u64]) -> Vec<(u64, [u8; 32])> {
+    (now.saturating_sub(512)..now).rev().filter(|s| !skipped.contains(s)).map(|s| (s, slot_hash(s))).collect()
+}

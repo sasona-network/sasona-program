@@ -22,6 +22,7 @@ custom-panic = []
 [dependencies]
 anchor-lang = { version = "1.2.0", features = ["init-if-needed"] }
 anchor-spl = { version = "1.2.0", features = ["token", "associated_token"] }
+solana-sha256-hasher = "3.1"
 
 [dev-dependencies]
 litesvm = "0.17.0"
@@ -36,6 +37,9 @@ solana-program-pack = "3"
 spl-token-interface = "2"
 spl-associated-token-account-interface = "2"
 solana-clock = "3.2"
+solana-slot-hashes = { version = "3.2", features = ["serde"] }
+solana-hash = "4"
+bincode = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

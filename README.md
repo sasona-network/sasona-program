@@ -28,6 +28,9 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `request_release` | Asks for some of your guarantee back. It stays in the cover, still paying claims, for 45 days. |
 | `release` | After the notice, pays your shares' part of the cover to you as coins. |
 | `join_cover` | A one-off: moves a guarantee made before the cover existed into it. |
+| `open_round` | Commits a draw: the list of services by its fingerprint, how many to pick, and the hash of a secret seed, with a 0.1 SOL bond. A list can be drawn once. |
+| `reveal_round` | Reveals the seed and mixes it with the hash of a Solana slot that did not exist at commit time. The bond goes back. The rule that turns the result into picks is in [sasona-protocol](https://github.com/sasona-network/sasona-protocol). |
+| `mark_withheld` | Marks a round whose seed was not revealed in time. It can never be drawn, and the bond is lost. |
 
 A deposit is split four ways:
 

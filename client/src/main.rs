@@ -9,6 +9,13 @@
 //!     sasona claim <dollars> <to dollar account> --keypair <judge key>
 //!     sasona ask-back <shares> --keypair <path>
 //!     sasona release --keypair <path>
+//!     sasona open-round <candidates file> <count> --keypair <path>
+//!     sasona reveal-round <candidates file> --keypair <path>
+//!     sasona withheld <candidates file> --keypair <path>
+//!
+//! A round is found by its list's fingerprint. open-round keeps the seed in
+//! `<keypair>.round-<fingerprint>.seed` until it is revealed; anyone who
+//! reads that file early can see the draw coming.
 //!
 //! The keypair signs and pays. It must hold the devnet dollar in its
 //! associated token account. Prints the transaction signature.
@@ -20,9 +27,10 @@ use anchor_client::{Client, Cluster, CommitmentConfig};
 use anchor_spl::associated_token::get_associated_token_address;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
-    POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED,
+    POOL_SEED, POOL_USD_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
 };
 use solana_keypair::read_keypair_file;
+use sha2::Digest;
 use solana_signer::Signer;
 
 const USAGE: &str = "usage: sasona <open|deposit|fee|depth> <dollars> --keypair <path>
@@ -30,10 +38,32 @@ const USAGE: &str = "usage: sasona <open|deposit|fee|depth> <dollars> --keypair 
        sasona join <owner> --keypair <path>
        sasona claim <dollars> <to dollar account> --keypair <judge key> [--reference <text>]
        sasona ask-back <shares> --keypair <path>
+       sasona open-round <candidates file> <count> | reveal-round <candidates file> | withheld <candidates file> --keypair <path>
        (all take [--url <rpc>])";
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn candidates_in(path: &str) -> Vec<String> {
+    let list = std::fs::read_to_string(path).expect("candidates file");
+    list.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// sasona-protocol SPEC.md 1.2.
+fn fingerprint_of(path: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for c in candidates_in(path) {
+        h.update(c.as_bytes());
+        h.update([0u8]);
+    }
+    h.finalize().into()
+}
+
+fn seed_file(keypair_path: &str, fingerprint: &[u8; 32]) -> String {
+    let hex: String = fingerprint.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{keypair_path}.round-{hex}.seed")
 }
 
 fn pda(seeds: &[&[u8]]) -> Pubkey {
@@ -43,13 +73,14 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
-    let keypair = read_keypair_file(arg(&args, "--keypair").expect(USAGE)).expect("cannot read keypair");
+    let keypair_path = arg(&args, "--keypair").expect(USAGE);
+    let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
     let cluster = match arg(&args, "--url") {
         Some(url) => Cluster::Custom(url.clone(), url.replace("https", "wss")),
         None => Cluster::Devnet,
@@ -174,6 +205,45 @@ fn main() {
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
             .args(sasona::instruction::Release {})
+    } else if command == "open-round" {
+        let fingerprint = fingerprint_of(&args[2]);
+        let size = candidates_in(&args[2]).len() as u32;
+        let count: u16 = args[3].parse().expect("count");
+        let mut seed = [0u8; 32];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").expect("urandom"), &mut seed).unwrap();
+        let seed_file = seed_file(&keypair_path, &fingerprint);
+        assert!(!std::path::Path::new(&seed_file).exists(), "a seed for this list already exists");
+        std::fs::write(&seed_file, seed).expect("write seed");
+        let seed_hash: [u8; 32] = sha2::Sha256::digest(seed).into();
+        eprintln!("round {} over {size} candidates, {count} picks", pda(&[ROUND_SEED, &fingerprint]));
+        request
+            .accounts(sasona::accounts::OpenRound {
+                opener: me,
+                round: pda(&[ROUND_SEED, &fingerprint]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::OpenRound { pool_fingerprint: fingerprint, pool_size: size, count, seed_hash })
+    } else if command == "reveal-round" {
+        let fingerprint = fingerprint_of(&args[2]);
+        let seed: [u8; 32] = std::fs::read(seed_file(&keypair_path, &fingerprint))
+            .expect("seed file")
+            .try_into()
+            .expect("32 bytes");
+        request
+            .accounts(sasona::accounts::RevealRound {
+                round: pda(&[ROUND_SEED, &fingerprint]),
+                opener: me,
+                slot_hashes: sasona::SLOT_HASHES_ID,
+            })
+            .args(sasona::instruction::RevealRound { seed })
+    } else if command == "withheld" {
+        let fingerprint = fingerprint_of(&args[2]);
+        request
+            .accounts(sasona::accounts::MarkWithheld {
+                round: pda(&[ROUND_SEED, &fingerprint]),
+                slot_hashes: sasona::SLOT_HASHES_ID,
+            })
+            .args(sasona::instruction::MarkWithheld {})
     } else if command == "settle" {
         request
             .accounts(sasona::accounts::SettleEntryFees {

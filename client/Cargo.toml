@@ -15,3 +15,4 @@ anchor-client = "1.2.0"
 anchor-spl = { version = "1.2.0", features = ["token", "associated_token"] }
 solana-keypair = "3"
 solana-signer = "3"
+sha2 = "0.10"
