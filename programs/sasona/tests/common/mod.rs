@@ -837,3 +837,21 @@ pub fn seat_of(svm: &LiteSVM, member: Address) -> Address {
         .unwrap_or(0);
     seat_address(k.max(1))
 }
+
+// ------------------------------------------------------------------- quotes
+
+pub fn quote_address(reading: Address) -> Address {
+    pda(&[sasona::QUOTE_SEED, reading.as_ref()])
+}
+
+pub fn set_quote_ix(svm: &LiteSVM, reader: Address, reading: Address, rate: u16) -> Instruction {
+    let accounts = sasona::accounts::SetQuote {
+        reader: key(reader),
+        reading: key(reading),
+        member: key(member_of(svm, reading)),
+        quote: key(quote_address(reading)),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SetQuote { rate }.data() }
+}

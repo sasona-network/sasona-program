@@ -192,6 +192,11 @@ pub const CHALLENGE_UPHELD: u8 = 2;
 /// A reading whose challenge was upheld. It no longer counts.
 pub const READING_FALSE: u8 = 3;
 
+/// Quotes (SPEC.md section 6): what the member who read a service would
+/// charge to insure a purchase from it, in basis points of its price.
+pub const QUOTE_SEED: &[u8] = b"quote";
+pub const MAX_QUOTE_BPS: u16 = 10_000;
+
 /// NOTE, temporary: who may approve a claim. Deciding claims belongs to
 /// members drawn at random, which is part 7 of the roadmap. Until then it is
 /// the key that can already upgrade this program, so nothing new is trusted.
@@ -883,6 +888,32 @@ pub mod sasona {
             m.stake = 0;
         }
         emit!(ChallengeUpheld { reading: ctx.accounts.reading.key(), number: m.number, stake_taken: stake });
+        Ok(())
+    }
+
+    /// Set, change or withdraw (`rate` 0) the quote on a reading (SPEC.md 6.1).
+    /// Only its reader can, and a rate only on a reading that counts, says
+    /// delivered, is still current, and whose membership is active.
+    pub fn set_quote(ctx: Context<SetQuote>, rate: u16) -> Result<()> {
+        let r = &ctx.accounts.reading;
+        let clock = Clock::get()?;
+        if rate > 0 {
+            require!(rate <= MAX_QUOTE_BPS, SasonaError::BadRate);
+            require!(r.state == READING_REVEALED, SasonaError::ReadingNotOpen);
+            require!(r.verdict == 1, SasonaError::NotDelivered);
+            require!(r.member > 0, SasonaError::NoMember);
+            require!(ctx.accounts.member.state == MEMBER_ACTIVE, SasonaError::NotActive);
+            let ends = r.reveal_time.checked_add(CHALLENGE_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;
+            require!(clock.unix_timestamp <= ends, SasonaError::WindowClosed);
+        }
+        let q = &mut ctx.accounts.quote;
+        q.reading = r.key();
+        q.member = r.member;
+        q.rate = rate;
+        q.set_slot = clock.slot;
+        q.set_time = clock.unix_timestamp;
+        q.bump = ctx.bumps.quote;
+        emit!(QuoteSet { reading: q.reading, member: q.member, rate, set_time: q.set_time });
         Ok(())
     }
 
@@ -2024,6 +2055,24 @@ pub struct UpholdChallenge<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct SetQuote<'info> {
+    #[account(mut)]
+    pub reader: Signer<'info>,
+
+    #[account(has_one = reader @ SasonaError::NotTheReader)]
+    pub reading: Account<'info, Reading>,
+
+    #[account(seeds = [MEMBER_SEED, reading.member.to_le_bytes().as_ref()], bump = member.bump)]
+    pub member: Account<'info, Member>,
+
+    #[account(init_if_needed, payer = reader, space = 8 + Quote::INIT_SPACE,
+              seeds = [QUOTE_SEED, reading.key().as_ref()], bump)]
+    pub quote: Account<'info, Quote>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // --------------------------------------------------------------------- state
 
 #[account]
@@ -2195,6 +2244,18 @@ pub struct Challenge {
     pub bump: u8,
 }
 
+/// The quote on one reading (SPEC.md 6.1). `rate` is 0 once withdrawn.
+#[account]
+#[derive(InitSpace)]
+pub struct Quote {
+    pub reading: Pubkey,
+    pub member: u32,
+    pub rate: u16,
+    pub set_slot: u64,
+    pub set_time: i64,
+    pub bump: u8,
+}
+
 /// A reading's reply, put on chain by its reader. Sealed once an answer holds.
 #[account]
 pub struct Evidence {
@@ -2352,6 +2413,14 @@ pub struct ReadingRevealed {
     pub reply_hash: [u8; 32],
     pub verdict: u8,
     pub reveal_slot: u64,
+}
+
+#[event]
+pub struct QuoteSet {
+    pub reading: Pubkey,
+    pub member: u32,
+    pub rate: u16,
+    pub set_time: i64,
 }
 
 #[event]
@@ -2678,6 +2747,10 @@ pub enum SasonaError {
     WindowClosed,
     #[msg("This membership sat down in its seat after the round was committed")]
     SatDownSince,
+    #[msg("A quote is between 1 and 10,000 basis points, or 0 to withdraw it")]
+    BadRate,
+    #[msg("Only a reading that says delivered can be insured")]
+    NotDelivered,
     #[msg("Arithmetic overflow")]
     Overflow,
 }
