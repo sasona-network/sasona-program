@@ -31,6 +31,11 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `open_round` | Commits a draw: the list of services by its fingerprint, how many to pick, and the hash of a secret seed, with a 0.1 SOL bond. A list can be drawn once. |
 | `reveal_round` | Reveals the seed and mixes it with the hash of a Solana slot that did not exist at commit time. The bond goes back. The rule that turns the result into picks is in [sasona-protocol](https://github.com/sasona-network/sasona-protocol). |
 | `mark_withheld` | Marks a round whose seed was not revealed in time. It can never be drawn, and the bond is lost. |
+| `commit_reading` | Before a drawn service is called, records the hash of the question for it. |
+| `reveal_reading` | After the call, reveals the nonce, the reply's hash and the verdict. The program builds the question from the nonce and refuses unless it is the one committed. A nonce belongs to the reading that committed to it first. |
+| `mark_lapsed` | Marks a reading not revealed within about an hour. |
+| `commit_second_reading` | A reading in a re-read round that names the earlier reading it tests again: the same service, someone else's reading, revealed before the round was committed. |
+| `settle_pair` | Once the second reading is revealed, records what the two settle: works now, false or decayed, or agreed fails. Anyone can call it. |
 
 A deposit is split four ways:
 
@@ -45,6 +50,7 @@ A deposit is split four ways:
 
 - None of the participant roles exists on chain yet, so their share of every fee goes to the network, and the network's coin waits in a vault held by the pool with no way out. Both change when developers, members, submitters and marketers come on chain.
 - Any caller can pay any fee, because there is no purchase on chain to tie it to yet. It has to be tied to real purchases before participants are paid.
+- A round's opener takes its readings. Members drawn at random take that over in part 5.
 - Claims are approved by the key that can already upgrade the program. Members drawn at random replace it in part 7 of the roadmap.
 - Once its notice has run out, a guarantee can be released just ahead of a claim its owner can see coming. Releases will pause while a claim is pending, once claims are filed on chain (part 7).
 
