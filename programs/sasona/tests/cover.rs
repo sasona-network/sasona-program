@@ -47,6 +47,51 @@ fn a_claim_pays_the_buyer_and_the_cover_carries_it() {
 }
 
 #[test]
+fn a_claim_after_the_price_has_moved_still_cannot_lower_it() {
+    // At the opening price every claim divides exactly, so nothing rounds.
+    // After a fee it does not, and the pool must give up at least the coins
+    // behind the dollars.
+    let (mut w, k, from) = two_depositors();
+    try_pay_fee(&mut w.svm, &k, from, 3 * DOLLAR + 7).unwrap();
+    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
+    for dollars in [DOLLAR + 7, 13 * DOLLAR + 1, 999_999] {
+        let before = pool(&w.svm);
+        assert_ne!((dollars as u128 * before.coin_reserve as u128) % before.usd_reserve as u128, 0,
+                   "this amount has to round, or it tests nothing");
+        claim_as_judge(&mut w.svm, buyer_usd, dollars).unwrap();
+        let after = pool(&w.svm);
+        assert!(after.usd_reserve as u128 * before.coin_reserve as u128
+            >= before.usd_reserve as u128 * after.coin_reserve as u128);
+        assert_books_balance(&w.svm);
+    }
+}
+
+#[test]
+fn new_shares_are_never_worth_more_than_the_coins_paid_for_them() {
+    let mut x: u64 = 0x5eed_5eed_5eed_5eed;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut rounded = 0;
+    for _ in 0..100_000 {
+        let cover_coins = 1 + next() % (1u64 << 40);
+        let cover_shares = 1 + next() % (1u64 << 44);
+        let coins = 1 + next() % (1u64 << 30);
+        let shares = shares_for(coins, cover_shares, cover_coins).unwrap();
+        let worth = shares as u128 * cover_coins as u128;
+        let paid = coins as u128 * cover_shares as u128;
+        assert!(worth <= paid, "coins {coins} cover {cover_coins}/{cover_shares}");
+        if worth < paid {
+            rounded += 1;
+        }
+    }
+    assert!(rounded > 50_000, "only {rounded} cases rounded");
+}
+
+#[test]
 fn a_claim_falls_on_every_share_alike() {
     let (mut w, k, _) = two_depositors();
     let opener = w.depositor.pubkey();
