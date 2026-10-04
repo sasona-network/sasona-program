@@ -46,8 +46,9 @@ fn the_reader_quotes_changes_and_withdraws() {
     let r = reading(&mut w, 1, true);
     quote(&mut w, &d, r, 120).unwrap();
     let q: Quote = read(&w.svm, quote_address(r));
-    let now = w.svm.get_sysvar::<solana_clock::Clock>().unix_timestamp;
-    assert_eq!((addr(q.reading), q.member, q.rate, q.set_time), (r, 1, 120, now));
+    let clock = w.svm.get_sysvar::<solana_clock::Clock>();
+    let now = clock.unix_timestamp;
+    assert_eq!((addr(q.reading), q.member, q.rate, q.set_slot, q.set_time), (r, 1, 120, clock.slot, now));
 
     seconds_pass(&mut w.svm, 60);
     quote(&mut w, &d, r, 450).unwrap();
@@ -133,5 +134,29 @@ fn a_reading_upheld_false_is_not_quoted() {
     days_pass(&mut w.svm, 8);
     try_with(&mut w.svm, |s| uphold_ix(s, r), &c).unwrap();
     let err = quote(&mut w, &d, r, 120).unwrap_err();
-    assert!(err.contains("ReadingNotOpen") || err.contains("NotActive"), "{err}");
+    assert!(err.contains("ReadingNotOpen"), "{err}");
+}
+
+#[test]
+fn every_rate_is_checked_even_the_lowest() {
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let r = reading(&mut w, 2, true);
+    let err = quote(&mut w, &d, r, 1).unwrap_err();
+    assert!(err.contains("NotDelivered"), "{err}");
+}
+
+#[test]
+fn the_membership_checked_is_the_readings_own() {
+    // A member who asked to leave cannot borrow someone else's active
+    // membership to keep quoting.
+    let mut w = world_with_member();
+    let d = w.depositor.insecure_clone();
+    let r = reading(&mut w, 1, true);
+    let (_b, _) = new_member(&mut w.svm);
+    try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
+    let mut ix = set_quote_ix(&w.svm, d.pubkey(), r, 120);
+    ix.accounts[2].pubkey = member_address(2);
+    let err = try_ix(&mut w.svm, ix, &d).unwrap_err();
+    assert!(err.contains("ConstraintSeeds"), "{err}");
 }

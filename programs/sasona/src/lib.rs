@@ -913,7 +913,7 @@ pub mod sasona {
         q.set_slot = clock.slot;
         q.set_time = clock.unix_timestamp;
         q.bump = ctx.bumps.quote;
-        emit!(QuoteSet { reading: q.reading, member: q.member, rate, set_time: q.set_time });
+        emit!(QuoteSet { reading: q.reading, member: q.member, rate, set_slot: q.set_slot, set_time: q.set_time });
         Ok(())
     }
 
@@ -2420,6 +2420,7 @@ pub struct QuoteSet {
     pub reading: Pubkey,
     pub member: u32,
     pub rate: u16,
+    pub set_slot: u64,
     pub set_time: i64,
 }
 
