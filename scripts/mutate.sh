@@ -191,7 +191,7 @@ reset() {
 
 build() { (cd "$WORK" && rm -f "$SO" && anchor build >/dev/null 2>&1) && [ -f "$SO" ]; }
 tests_compile() { (cd "$WORK" && cargo test -q -p sasona --no-run >/dev/null 2>&1); }
-tests_pass() { (cd "$WORK" && SASONA_SO="$SO" cargo test -q -p sasona -- --test-threads=1 >/dev/null 2>&1); }
+tests_pass() { (cd "$WORK" && SASONA_SO="$SO" cargo test -q -p sasona >/dev/null 2>&1); }
 
 reset
 if ! build || ! tests_compile || ! tests_pass; then

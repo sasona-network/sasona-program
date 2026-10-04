@@ -36,6 +36,13 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `mark_lapsed` | Marks a reading not revealed within about an hour. |
 | `commit_second_reading` | A reading in a re-read round that names the earlier reading it tests again: the same service, someone else's reading, revealed before the round was committed. |
 | `settle_pair` | Once the second reading is revealed, records what the two settle: works now, false or decayed, or agreed fails. Anyone can call it. |
+| `join_members` | Locks one stake of coin as a membership, which sits in the seat after the last. |
+| `ask_to_leave` | Takes a membership off the roster at once; the membership in the last seat moves into its seat. |
+| `leave` | After 45 days' notice, and with no challenge open, gives the stake back. |
+| `challenge` | Challenges a reading within 30 days of its reveal, for a 0.1 SOL bond. |
+| `open_evidence`, `write_evidence` | The reader puts a reading's reply on chain, in pieces. |
+| `answer_challenge` | Holds if the reply on chain hashes to what was recorded and gives the recorded verdict for the nonce. The bond goes to the member and the reply is sealed. |
+| `uphold_challenge` | After 7 days with no answer that held: the reading stops counting and the membership loses its stake, a tenth to the challenger and the rest held. |
 
 A deposit is split four ways:
 
@@ -50,7 +57,9 @@ A deposit is split four ways:
 
 - None of the participant roles exists on chain yet, so their share of every fee goes to the network, and the network's coin waits in a vault held by the pool with no way out. Both change when developers, members, submitters and marketers come on chain.
 - Any caller can pay any fee, because there is no purchase on chain to tie it to yet. It has to be tied to real purchases before participants are paid.
-- A round's opener takes its readings. Members drawn at random take that over in part 5.
+- Each reading is taken by the member drawn for it, but the round's opener still writes the list and picks when to open it.
+- The stake, the challenge bond and the challenger's tenth are devnet figures. A stake that deters has to grow with the traffic a service carries, which needs purchases on chain.
+- Taken stakes are held with no way out until chargebacks are on chain (part 7), which decides where they go.
 - Claims are approved by the key that can already upgrade the program. Members drawn at random replace it in part 7 of the roadmap.
 - Once its notice has run out, a guarantee can be released just ahead of a claim its owner can see coming. Releases will pause while a claim is pending, once claims are filed on chain (part 7).
 
