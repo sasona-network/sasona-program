@@ -15,7 +15,7 @@ pub use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint
 pub use sasona::{at_price, burn_of, coins_out, Fee, NETWORK_SEED, BURN_BPS, 
     Guarantee, Pool, Slices, COIN_DECIMALS, COIN_SEED, FEES_SEED, GUARANTEE_SEED, OPENING_COINS_PER_USD,
     POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED,
-    Cover, Exit, JUDGE, MAX_SHARES_PER_COIN, NOTICE_SECONDS, coins_for_shares, shares_for,
+    Cover, Exit, MAX_SHARES_PER_COIN, NOTICE_SECONDS, coins_for_shares, shares_for,
 };
 
 pub const DOLLAR: u64 = 1_000_000;
@@ -324,37 +324,6 @@ pub fn cover(svm: &LiteSVM) -> Cover {
     read(svm, pda(&[COVER_SEED]))
 }
 
-pub fn claim_ix(judge: Address, to: Address, dollars: u64) -> Instruction {
-    let accounts = sasona::accounts::Claim {
-        judge: key(judge),
-        pool: key(pda(&[POOL_SEED])),
-        coin_mint: key(pda(&[COIN_SEED])),
-        usd_mint: key(usd()),
-        pool_usd: key(pda(&[POOL_USD_SEED])),
-        pool_coin: key(pda(&[POOL_COIN_SEED])),
-        fees: key(pda(&[FEES_SEED])),
-        cover: key(pda(&[COVER_SEED])),
-        cover_vault: key(pda(&[COVER_VAULT_SEED])),
-        claimant_usd: key(to),
-        token_program: anchor_spl::token::ID,
-    }
-    .to_account_metas(None);
-    let data = sasona::instruction::Claim { dollars, reference: [7u8; 32] }.data();
-    Instruction { program_id: program_id(), accounts: metas(accounts), data }
-}
-
-/// Send as the judge. Only works in `world_unverified`.
-pub fn claim_as_judge(svm: &mut LiteSVM, to: Address, dollars: u64) -> Result<(), String> {
-    let judge = addr(JUDGE);
-    if svm.get_account(&judge).map(|a| a.lamports).unwrap_or(0) == 0 {
-        svm.airdrop(&judge, 10_000_000_000).unwrap();
-    }
-    svm.expire_blockhash();
-    let msg = solana_message::Message::new_with_blockhash(&[claim_ix(judge, to, dollars)], Some(&judge), &svm.latest_blockhash());
-    let tx = Transaction::new_unsigned(msg);
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}\n{}", e.err, e.meta.logs.join("\n")))
-}
-
 pub fn request_ix(owner: Address, shares: u64) -> Instruction {
     let accounts = sasona::accounts::RequestRelease {
         owner: key(owner),
@@ -509,6 +478,11 @@ pub fn commit_reading_ix(svm: &LiteSVM, reader: Address, round: Address, endpoin
 }
 
 pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8) -> Instruction {
+    reveal_paid_ix(reader, reading, nonce, reply_hash, verdict, Address::default())
+}
+
+/// A reveal that also records where the service asks to be paid (7.1).
+pub fn reveal_paid_ix(reader: Address, reading: Address, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8, pay_to: Address) -> Instruction {
     let accounts = sasona::accounts::RevealReading {
         reader: key(reader),
         reading: key(reading),
@@ -516,7 +490,7 @@ pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], rep
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
-    let data = sasona::instruction::RevealReading { nonce, reply_hash, verdict }.data();
+    let data = sasona::instruction::RevealReading { nonce, reply_hash, verdict, pay_to: key(pay_to) }.data();
     Instruction { program_id: program_id(), accounts: metas(accounts), data }
 }
 
@@ -686,6 +660,7 @@ pub fn leave_ix(owner: Address, number: u32) -> Instruction {
         member: key(member_address(number)),
         stakes: key(pda(&[sasona::STAKES_SEED])),
         owner_coin: key(ata(owner, coin)),
+        book: key(book_address(number)),
         token_program: anchor_spl::token::ID,
     }
     .to_account_metas(None);
@@ -814,7 +789,8 @@ pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
         pool: key(pda(&[POOL_SEED])),
         coin_mint: key(coin),
         stakes: key(pda(&[sasona::STAKES_SEED])),
-        held: key(pda(&[sasona::HELD_SEED])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
         challenger: c.challenger,
         challenger_coin: key(ata(addr(c.challenger), coin)),
         token_program: anchor_spl::token::ID,
@@ -854,4 +830,294 @@ pub fn set_quote_ix(svm: &LiteSVM, reader: Address, reading: Address, rate: u16)
     }
     .to_account_metas(None);
     Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SetQuote { rate }.data() }
+}
+
+// ------------------------------------------------- purchases and chargebacks
+
+pub fn book_address(number: u32) -> Address {
+    pda(&[sasona::BOOK_SEED, &number.to_le_bytes()])
+}
+
+pub fn book(svm: &LiteSVM, number: u32) -> sasona::Book {
+    read(svm, book_address(number))
+}
+
+pub fn purchase_address(buyer: Address, id: u64) -> Address {
+    pda(&[sasona::PURCHASE_SEED, buyer.as_ref(), &id.to_le_bytes()])
+}
+
+pub fn chargeback_address(purchase: Address) -> Address {
+    pda(&[sasona::CHARGEBACK_SEED, purchase.as_ref()])
+}
+
+pub fn chargeback(svm: &LiteSVM, purchase: Address) -> sasona::Chargeback {
+    read(svm, chargeback_address(purchase))
+}
+
+pub fn replay_address(chargeback: Address, draw: u8) -> Address {
+    pda(&[sasona::READING_SEED, chargeback.as_ref(), &[draw]])
+}
+
+/// The merchant's address for tests, and a dollar account it holds.
+pub const MERCHANT: Address = Address::new_from_array([77u8; 32]);
+pub fn merchant_usd(svm: &mut LiteSVM) -> Address {
+    let at = Address::new_from_array([78u8; 32]);
+    if svm.get_account(&at).is_none() {
+        put_token_account(svm, at, usd(), MERCHANT, 0);
+    }
+    at
+}
+
+/// A dollar account for `who`, made if they have none, at a fixed address.
+pub fn usd_of(svm: &mut LiteSVM, who: Address) -> Address {
+    let at = ata(who, usd());
+    if svm.get_account(&at).is_none() {
+        put_token_account(svm, at, usd(), who, 0);
+    }
+    at
+}
+
+/// The merchant's and the quoter's dollar accounts must exist already, as
+/// `insured_reading` leaves them.
+pub fn buy_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, reading: Address, id: u64, price: u64) -> Instruction {
+    let r: sasona::Reading = read(svm, reading);
+    let quoter = member(svm, r.member).owner;
+    let merchant = Address::new_from_array([78u8; 32]);
+    let quoter_usd = ata(addr(quoter), usd());
+    let accounts = sasona::accounts::Buy {
+        buyer: key(buyer),
+        buyer_usd: key(buyer_usd),
+        usd_mint: key(usd()),
+        pool: key(pda(&[POOL_SEED])),
+        reading: key(reading),
+        quote: key(quote_address(reading)),
+        member: key(member_address(r.member)),
+        book: key(book_address(r.member)),
+        purchase: key(purchase_address(buyer, id)),
+        merchant_usd: key(merchant),
+        quoter_usd: key(quoter_usd),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Buy { id, price }.data() }
+}
+
+pub fn close_purchase_ix(svm: &LiteSVM, purchase: Address) -> Instruction {
+    let pu: sasona::Purchase = read(svm, purchase);
+    let accounts = sasona::accounts::ClosePurchase { purchase: key(purchase), book: key(book_address(pu.member)) }.to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::ClosePurchase {}.data() }
+}
+
+pub fn charge_back_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, purchase: Address) -> Instruction {
+    let pu: sasona::Purchase = read(svm, purchase);
+    let accounts = sasona::accounts::ChargeBack {
+        buyer: key(buyer),
+        buyer_usd: key(buyer_usd),
+        usd_mint: key(usd()),
+        pool: key(pda(&[POOL_SEED])),
+        purchase: key(purchase),
+        member: key(member_address(pu.member)),
+        members: key(members_address()),
+        service_terms: key(pda(&[sasona::SERVICE_SEED, &pu.service])),
+        chargeback: key(chargeback_address(purchase)),
+        escrow: key(pda(&[sasona::ESCROW_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::ChargeBack {}.data() }
+}
+
+pub fn record_draw_ix(purchase: Address) -> Instruction {
+    let accounts = sasona::accounts::RecordDraw { chargeback: key(chargeback_address(purchase)), slot_hashes: sasona::SLOT_HASHES_ID }
+        .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::RecordDraw {}.data() }
+}
+
+/// 7.4, followed against the accounts: the seat drawn for the chargeback's
+/// current draw, and the seats passed over before it that must be shown.
+/// The draw's entropy must already be recorded.
+pub fn replay_drawn_for(svm: &LiteSVM, purchase: Address) -> (Option<u32>, Vec<u32>) {
+    let c = chargeback(svm, purchase);
+    let mut skipped = vec![];
+    if c.draw_members == 0 {
+        return (None, skipped);
+    }
+    let declined = &c.declined[..c.counted_draws as usize];
+    let now = seated(svm);
+    for a in 0..sasona::MAX_READER_ATTEMPTS {
+        let k = sasona::reader_number(&c.seed, &c.service, a, c.draw_members);
+        if k > now {
+            continue;
+        }
+        let s = seat(svm, k);
+        if s.since >= c.draw_slot || s.owner == c.buyer || s.owner == c.quoter || declined.contains(&s.member) {
+            skipped.push(k);
+            continue;
+        }
+        return (Some(k), skipped);
+    }
+    (None, skipped)
+}
+
+/// A replay commitment by `reader`, with the seat drawn and the seats passed
+/// over; if they were not drawn, it names their own seat and shows nothing.
+pub fn commit_replay_ix(svm: &LiteSVM, reader: Address, purchase: Address, endpoint: &str, question_hash: [u8; 32]) -> Instruction {
+    let c = chargeback(svm, purchase);
+    let cb = chargeback_address(purchase);
+    let (drawn, skipped) = if c.seed == [0u8; 32] { (None, vec![]) } else { replay_drawn_for(svm, purchase) };
+    let (number, shown) = match drawn {
+        Some(k) if addr(seat(svm, k).owner) == reader => (seat(svm, k).member, skipped),
+        _ => {
+            let owned: Vec<u32> = (1..=member_count(svm)).filter(|&n| addr(member(svm, n).owner) == reader).collect();
+            (owned.iter().copied().find(|&n| member(svm, n).seat > 0).or(owned.first().copied()).unwrap_or(1), vec![])
+        }
+    };
+    let m = member_address(number);
+    let accounts = sasona::accounts::CommitReplay {
+        reader: key(reader),
+        chargeback: key(cb),
+        members: key(members_address()),
+        member: key(m),
+        seat: key(seat_of(svm, m)),
+        replay: key(replay_address(cb, c.draw)),
+        slot_hashes: sasona::SLOT_HASHES_ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let mut accounts = metas(accounts);
+    accounts.extend(shown.into_iter().map(|k| AccountMeta::new_readonly(seat_address(k), false)));
+    let data = sasona::instruction::CommitReplay { endpoint: endpoint.to_string(), question_hash }.data();
+    Instruction { program_id: program_id(), accounts, data }
+}
+
+/// Pass the current draw, naming the seat it drew with its proof, if any.
+pub fn pass_draw_ix(svm: &LiteSVM, purchase: Address) -> Instruction {
+    let c = chargeback(svm, purchase);
+    let cb = chargeback_address(purchase);
+    let (drawn, skipped) = if c.seed == [0u8; 32] { (None, vec![]) } else { replay_drawn_for(svm, purchase) };
+    let accounts = sasona::accounts::PassDraw {
+        chargeback: key(cb),
+        members: key(members_address()),
+        replay: key(replay_address(cb, c.draw)),
+        slot_hashes: sasona::SLOT_HASHES_ID,
+    }
+    .to_account_metas(None);
+    let mut accounts = metas(accounts);
+    if let Some(k) = drawn {
+        accounts.push(AccountMeta::new_readonly(seat_address(k), false));
+    }
+    accounts.extend(skipped.into_iter().map(|k| AccountMeta::new_readonly(seat_address(k), false)));
+    let data = sasona::instruction::PassDraw { drawn_seat: drawn.unwrap_or(0) }.data();
+    Instruction { program_id: program_id(), accounts, data }
+}
+
+pub fn settle_chargeback_ix(svm: &mut LiteSVM, purchase: Address) -> Instruction {
+    let c = chargeback(svm, purchase);
+    let cb = chargeback_address(purchase);
+    let replay = replay_address(cb, c.draw);
+    let replayer = svm
+        .get_account(&replay)
+        .and_then(|a| sasona::Reading::try_deserialize(&mut a.data.as_slice()).ok())
+        .filter(|r| r.state == sasona::READING_REVEALED)
+        .map(|r| addr(r.reader));
+    let replayer_usd = replayer.map(|r| usd_of(svm, r));
+    let buyer_usd = usd_of(svm, addr(c.buyer));
+    let pu: sasona::Purchase = read(svm, purchase);
+    let accounts = sasona::accounts::SettleChargeback {
+        chargeback: key(cb),
+        purchase: key(purchase),
+        book: key(book_address(pu.member)),
+        replay: key(replay),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        pool_coin: key(pda(&[POOL_COIN_SEED])),
+        fees: key(pda(&[FEES_SEED])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        escrow: key(pda(&[sasona::ESCROW_SEED])),
+        buyer_usd: key(buyer_usd),
+        replayer_usd: replayer_usd.map(key),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SettleChargeback {}.data() }
+}
+
+pub fn repay_cover_ix(svm: &LiteSVM, purchase: Address) -> Instruction {
+    let c = chargeback(svm, purchase);
+    let accounts = sasona::accounts::RepayCover {
+        chargeback: key(chargeback_address(purchase)),
+        book: key(book_address(c.member)),
+        member: key(member_address(c.member)),
+        pool: key(pda(&[POOL_SEED])),
+        stakes: key(pda(&[sasona::STAKES_SEED])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::RepayCover {}.data() }
+}
+
+/// In a world with the pool open: membership 1 (the depositor) reads
+/// `service` in a round drawn at `slot`, finds it delivering, records the
+/// merchant's address, and quotes it at `rate`. Returns the reading.
+pub fn insured_reading(w: &mut World, service: &str, rate: u16, slot: u64) -> Address {
+    if member_count(&w.svm) == 0 {
+        let d = w.depositor.insecure_clone();
+        join(&mut w.svm, &d);
+    }
+    let d = w.depositor.insecure_clone();
+    let fp = sha256(service.as_bytes());
+    let seed = sha256(&fp);
+    w.svm.warp_to_slot(slot);
+    try_ix(&mut w.svm, open_round_ix(d.pubkey(), fp, 10, 2, sha256(&seed)), &d).unwrap();
+    at_slot(&mut w.svm, slot + 40, &recent(slot + 40, &[]));
+    let round = round_address(fp);
+    try_ix(&mut w.svm, reveal_ix(round, d.pubkey(), seed), &d).unwrap();
+    let nonce: [u8; 16] = fp[..16].try_into().unwrap();
+    let q = sha256(&sasona::canonical_question(&nonce));
+    try_with(&mut w.svm, |s| commit_reading_ix(s, d.pubkey(), round, service, q), &d).unwrap();
+    let reading = reading_address(round, service);
+    w.svm.warp_to_slot(slot + 41);
+    try_ix(&mut w.svm, reveal_paid_ix(d.pubkey(), reading, nonce, [9u8; 32], 1, MERCHANT), &d).unwrap();
+    merchant_usd(&mut w.svm);
+    usd_of(&mut w.svm, d.pubkey());
+    try_with(&mut w.svm, |s| set_quote_ix(s, d.pubkey(), reading, rate), &d).unwrap();
+    reading
+}
+
+/// Someone new with `dollars` to spend, in an account `usd_of` finds.
+pub fn new_buyer(svm: &mut LiteSVM, dollars: u64) -> Keypair {
+    let k = Keypair::new();
+    svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
+    put_token_account(svm, ata(k.pubkey(), usd()), usd(), k.pubkey(), dollars);
+    k
+}
+
+/// Pay `dollars` back out of the cover the way it now happens: a covered
+/// purchase, a chargeback, and 7 days with no replay. Returns the buyer's
+/// dollar account, which ends holding exactly `dollars`.
+pub fn pay_back(w: &mut World, dollars: u64) -> Result<Address, String> {
+    const SERVICE: &str = "https://paid-back.example/run";
+    let reading = reading_address(round_address(sha256(SERVICE.as_bytes())), SERVICE);
+    if w.svm.get_account(&reading).is_none() {
+        let slot = w.svm.get_sysvar::<solana_clock::Clock>().slot.max(1) + 1_000;
+        insured_reading(w, SERVICE, 100, slot);
+    }
+    let buyer = new_buyer(&mut w.svm, dollars + dollars / 10 + 1);
+    let usd_acc = ata(buyer.pubkey(), usd());
+    let id = 1;
+    try_with(&mut w.svm, |s| buy_ix(s, buyer.pubkey(), usd_acc, reading, id, dollars), &buyer)?;
+    let purchase = purchase_address(buyer.pubkey(), id);
+    try_with(&mut w.svm, |s| charge_back_ix(s, buyer.pubkey(), usd_acc, purchase), &buyer)?;
+    // Spend what is left, so the account holds only what comes back.
+    put_token_account(&mut w.svm, usd_acc, usd(), buyer.pubkey(), 0);
+    days_pass(&mut w.svm, 8);
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    try_ix(&mut w.svm, ix, &buyer)?;
+    Ok(usd_acc)
 }

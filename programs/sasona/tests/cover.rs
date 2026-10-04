@@ -1,4 +1,4 @@
-//! The cover: claims paid out of it, guarantees asked back and released,
+//! The cover: buyers paid back out of it, guarantees asked back and released,
 //! and the move of guarantees made before it existed. Run against the
 //! compiled program.
 
@@ -6,7 +6,7 @@ mod common;
 use anchor_lang::AccountSerialize;
 use common::*;
 
-/// Opened, with a second depositor, in a world where a test may act as judge.
+/// Opened, with a second depositor.
 fn two_depositors() -> (World, Keypair, Address) {
     let mut w = world_unverified();
     open(&mut w, 1_220 * DOLLAR);
@@ -20,18 +20,25 @@ fn coins_per_share_e12(svm: &LiteSVM) -> u128 {
     c.coins as u128 * 1_000_000_000_000 / c.shares as u128
 }
 
-// ----------------------------------------------------------------- claims
+// ------------------------------------------------- paying a buyer back
+
+// A buyer is paid back from the cover by a chargeback (part 7). Here the
+// chargeback is left with no replay for 7 days, so the cover pays the price
+// and nothing else, and the arithmetic of a payout is all that is tested.
+// A member's room to insure is about $2 of stake, which bounds the amounts.
 
 #[test]
-fn a_claim_pays_the_buyer_and_the_cover_carries_it() {
+fn a_payout_pays_the_buyer_and_the_cover_carries_it() {
     let (mut w, _, _) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
+    let dollars = DOLLAR + 250_000;
+    let (purchase, buyer) = charged_back(&mut w, dollars);
+    let buyer_usd = ata(buyer.pubkey(), usd());
     let before = pool(&w.svm);
     let cover_before = cover(&w.svm);
     let supply = mint_state(&w.svm, pda(&[COIN_SEED])).supply;
 
-    let dollars = 25 * DOLLAR;
-    claim_as_judge(&mut w.svm, buyer_usd, dollars).unwrap();
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    try_ix(&mut w.svm, ix, &buyer).unwrap();
 
     let burn = (dollars as u128 * before.coin_reserve as u128).div_ceil(before.usd_reserve as u128) as u64;
     let after = pool(&w.svm);
@@ -47,18 +54,19 @@ fn a_claim_pays_the_buyer_and_the_cover_carries_it() {
 }
 
 #[test]
-fn a_claim_after_the_price_has_moved_still_cannot_lower_it() {
-    // At the opening price every claim divides exactly, so nothing rounds.
+fn a_payout_after_the_price_has_moved_still_cannot_lower_it() {
+    // At the opening price every payout divides exactly, so nothing rounds.
     // After a fee it does not, and the pool must give up at least the coins
     // behind the dollars.
     let (mut w, k, from) = two_depositors();
     try_pay_fee(&mut w.svm, &k, from, 3 * DOLLAR + 7).unwrap();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    for dollars in [DOLLAR + 7, 13 * DOLLAR + 1, 999_999] {
+    for dollars in [300_007, 400_001, 299_999] {
+        let (purchase, buyer) = charged_back(&mut w, dollars);
         let before = pool(&w.svm);
         assert_ne!((dollars as u128 * before.coin_reserve as u128) % before.usd_reserve as u128, 0,
                    "this amount has to round, or it tests nothing");
-        claim_as_judge(&mut w.svm, buyer_usd, dollars).unwrap();
+        let ix = settle_chargeback_ix(&mut w.svm, purchase);
+        try_ix(&mut w.svm, ix, &buyer).unwrap();
         let after = pool(&w.svm);
         assert!(after.usd_reserve as u128 * before.coin_reserve as u128
             >= before.usd_reserve as u128 * after.coin_reserve as u128);
@@ -92,16 +100,17 @@ fn new_shares_are_never_worth_more_than_the_coins_paid_for_them() {
 }
 
 #[test]
-fn a_claim_falls_on_every_share_alike() {
+fn a_payout_falls_on_every_share_alike() {
     let (mut w, k, _) = two_depositors();
     let opener = w.depositor.pubkey();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
     let worth = |svm: &LiteSVM, who: Address| {
         let c = cover(svm);
         coins_for_shares(shares_of(svm, who), c.shares, c.coins).unwrap()
     };
+    let (purchase, buyer) = charged_back(&mut w, DOLLAR + 500_000);
     let (a0, b0) = (worth(&w.svm, opener), worth(&w.svm, k.pubkey()));
-    claim_as_judge(&mut w.svm, buyer_usd, 100 * DOLLAR).unwrap();
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    try_ix(&mut w.svm, ix, &buyer).unwrap();
     let (a1, b1) = (worth(&w.svm, opener), worth(&w.svm, k.pubkey()));
     // Both lost the same fraction, to within a unit of rounding.
     let lhs = a1 as u128 * b0 as u128;
@@ -110,71 +119,110 @@ fn a_claim_falls_on_every_share_alike() {
     assert!(a1 < a0 && b1 < b0);
 }
 
-#[test]
-fn only_the_judge_can_approve_a_claim() {
-    let (mut w, k, from) = two_depositors();
-    let err = try_ix(&mut w.svm, claim_ix(k.pubkey(), from, DOLLAR), &k).unwrap_err();
-    assert!(err.contains("NotTheJudge"), "{err}");
+/// Overwrite the cover's record, keeping the vault as it is.
+fn set_cover(svm: &mut LiteSVM, coins: u64, shares: u64) {
+    let c: Cover = read(svm, pda(&[COVER_SEED]));
+    let mut data = Vec::new();
+    Cover { bump: c.bump, shares, coins }.try_serialize(&mut data).unwrap();
+    overwrite(svm, pda(&[COVER_SEED]), &data);
 }
 
 #[test]
-fn a_claim_larger_than_the_cover_is_refused() {
+fn a_payout_larger_than_the_cover_waits() {
     let (mut w, _, _) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    // The cover is 75% of 85% of the deposits, about $1,032; the pool holds more.
-    let err = claim_as_judge(&mut w.svm, buyer_usd, 1_100 * DOLLAR).unwrap_err();
+    let (purchase, buyer) = charged_back(&mut w, DOLLAR);
+    // A cover with less in it than this payout would burn.
+    set_cover(&mut w.svm, 1_000, 1_000);
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    let err = try_ix(&mut w.svm, ix, &buyer).unwrap_err();
     assert!(err.contains("MoreThanIsThere"), "{err}");
+    let c = chargeback(&w.svm, purchase);
+    assert_eq!(c.state, sasona::CHARGEBACK_OPEN, "the chargeback waits, and can be settled later");
 }
 
 #[test]
-fn a_claim_of_nothing_is_refused() {
+fn a_payout_that_would_thin_the_cover_too_far_waits() {
     let (mut w, _, _) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    let err = claim_as_judge(&mut w.svm, buyer_usd, 0).unwrap_err();
-    assert!(err.contains("NothingDeposited"), "{err}");
+    let (purchase, buyer) = charged_back(&mut w, DOLLAR);
+    let p = pool(&w.svm);
+    let burn = (DOLLAR as u128 * p.coin_reserve as u128).div_ceil(p.usd_reserve as u128) as u64;
+    let coins = cover(&w.svm).coins;
+    // As many shares as leave exactly one coin unit per thousand after the burn,
+    // plus one: the payout would thin it past that.
+    set_cover(&mut w.svm, coins, (coins - burn) * MAX_SHARES_PER_COIN + 1);
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    let err = try_ix(&mut w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("CoverTooThin"), "{err}");
+    set_cover(&mut w.svm, coins, (coins - burn) * MAX_SHARES_PER_COIN);
+    let ix = settle_chargeback_ix(&mut w.svm, purchase);
+    try_ix(&mut w.svm, ix, &buyer).unwrap();
 }
 
 #[test]
-fn a_claim_paid_in_another_token_is_refused() {
+fn a_payout_goes_only_to_the_buyer_and_in_dollars() {
     let (mut w, k, _) = two_depositors();
+    let (purchase, buyer) = charged_back(&mut w, DOLLAR);
+    // Another token, into an account the buyer holds.
     let other = Address::new_unique();
     put_mint(&mut w.svm, other, k.pubkey(), 6);
     let wrong = Address::new_unique();
-    put_token_account(&mut w.svm, wrong, other, k.pubkey(), 0);
-    let err = claim_as_judge(&mut w.svm, wrong, DOLLAR).unwrap_err();
+    put_token_account(&mut w.svm, wrong, other, buyer.pubkey(), 0);
+    let mut ix = settle_chargeback_ix(&mut w.svm, purchase);
+    ix.accounts[12].pubkey = wrong;
+    let err = try_ix(&mut w.svm, ix, &buyer).unwrap_err();
     assert!(err.contains("ConstraintTokenMint"), "{err}");
+    // The pool's own dollar account, or the fee account, in place of the buyer's.
+    for own in [pda(&[POOL_USD_SEED]), pda(&[FEES_SEED])] {
+        let mut ix = settle_chargeback_ix(&mut w.svm, purchase);
+        ix.accounts[12].pubkey = own;
+        let err = try_ix(&mut w.svm, ix, &buyer).unwrap_err();
+        assert!(err.contains("NotTheOwner") || err.contains("ConstraintDuplicateMutableAccount"), "{err}");
+    }
 }
 
 #[test]
 fn a_look_alike_cover_vault_is_refused() {
     let (mut w, k, _) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
+    let (purchase, buyer) = charged_back(&mut w, DOLLAR);
     let look_alike = Address::new_unique();
     put_token_account(&mut w.svm, look_alike, pda(&[COIN_SEED]), k.pubkey(), u64::MAX / 4);
-    let judge = addr(JUDGE);
-    w.svm.airdrop(&judge, 10_000_000_000).unwrap();
-    let mut ix = claim_ix(judge, buyer_usd, DOLLAR);
-    ix.accounts[8].pubkey = look_alike;
-    let msg = solana_message::Message::new_with_blockhash(&[ix], Some(&judge), &w.svm.latest_blockhash());
-    let err = w.svm.send_transaction(Transaction::new_unsigned(msg)).unwrap_err();
-    assert!(format!("{:?}", e_logs(&err)).contains("ConstraintSeeds"));
-}
-
-fn e_logs(e: &litesvm::types::FailedTransactionMetadata) -> String {
-    e.meta.logs.join("\n")
+    let mut ix = settle_chargeback_ix(&mut w.svm, purchase);
+    ix.accounts[10].pubkey = look_alike;
+    let err = try_ix(&mut w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("ConstraintSeeds"), "{err}");
 }
 
 #[test]
-fn depositing_after_a_claim_does_not_dilute_anyone() {
+fn depositing_after_a_payout_does_not_dilute_anyone() {
     let (mut w, k, from) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    claim_as_judge(&mut w.svm, buyer_usd, 100 * DOLLAR).unwrap();
+    pay_back(&mut w, DOLLAR + 500_000).unwrap();
     let per_share = coins_per_share_e12(&w.svm);
     try_deposit(&mut w.svm, &k, from, 200 * DOLLAR).unwrap();
     // New shares were bought at the lower rate, so a share is worth the same.
     assert!(coins_per_share_e12(&w.svm) >= per_share);
     assert!(coins_per_share_e12(&w.svm) - per_share <= 1_000_000_000_000 / 1_000);
     assert_books_balance(&w.svm);
+}
+
+/// A covered purchase of `dollars`, charged back, with its 7 days for a
+/// replay gone by: ready to settle. The buyer's dollar account is emptied,
+/// so it ends holding only what comes back.
+fn charged_back(w: &mut World, dollars: u64) -> (Address, Keypair) {
+    // A service of its own each time keeps every chargeback the first on its
+    // service in 30 days, and so free of deposits.
+    let slot = w.svm.get_sysvar::<solana_clock::Clock>().slot + 1_000;
+    let service = format!("https://paid-back.example/run/{slot}");
+    let reading = insured_reading(w, &service, 100, slot);
+    let buyer = new_buyer(&mut w.svm, 2 * dollars);
+    let usd_acc = ata(buyer.pubkey(), usd());
+    try_with(&mut w.svm, |s| buy_ix(s, buyer.pubkey(), usd_acc, reading, 1, dollars), &buyer).unwrap();
+    let purchase = purchase_address(buyer.pubkey(), 1);
+    try_with(&mut w.svm, |s| charge_back_ix(s, buyer.pubkey(), usd_acc, purchase), &buyer).unwrap();
+    put_token_account(&mut w.svm, usd_acc, usd(), buyer.pubkey(), 0);
+    let deposit = chargeback(&w.svm, purchase).deposit;
+    assert_eq!(deposit, 0, "the first chargeback on a service in 30 days needs no deposit");
+    days_pass(&mut w.svm, 8);
+    (purchase, buyer)
 }
 
 // ---------------------------------------------------------------- release
@@ -203,15 +251,14 @@ fn a_guarantee_comes_back_after_the_notice_and_not_before() {
 }
 
 #[test]
-fn a_claim_during_the_notice_still_lands_on_the_leaver() {
+fn a_payout_during_the_notice_still_lands_on_the_leaver() {
     let (mut w, k, _) = two_depositors();
     let shares = shares_of(&w.svm, k.pubkey());
     try_ix(&mut w.svm, request_ix(k.pubkey(), shares), &k).unwrap();
     let c = cover(&w.svm);
     let before_claim = coins_for_shares(shares, c.shares, c.coins).unwrap();
 
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    claim_as_judge(&mut w.svm, buyer_usd, 200 * DOLLAR).unwrap();
+    pay_back(&mut w, DOLLAR + 500_000).unwrap();
 
     days_pass(&mut w.svm, 46);
     let held = token_balance(&w.svm, ata(k.pubkey(), pda(&[COIN_SEED])));
@@ -269,8 +316,7 @@ fn nobody_can_release_someone_elses_exit() {
 fn the_last_one_out_takes_every_coin_left() {
     let mut w = world_unverified();
     open(&mut w, 1_220 * DOLLAR);
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    claim_as_judge(&mut w.svm, buyer_usd, 77 * DOLLAR + 3).unwrap();
+    pay_back(&mut w, DOLLAR + 3).unwrap();
     let d = w.depositor.insecure_clone();
     let shares = shares_of(&w.svm, d.pubkey());
     try_ix(&mut w.svm, request_ix(d.pubkey(), shares), &d).unwrap();
@@ -358,45 +404,6 @@ fn a_stray_coin_in_the_old_vault_cannot_block_the_move() {
     try_ix(&mut w.svm, join_ix(anyone.pubkey(), d), &anyone).unwrap();
     assert_eq!(shares_of(&w.svm, d), coins + 1);
     assert_books_balance(&w.svm);
-}
-
-#[test]
-fn a_claim_that_would_thin_the_cover_too_far_is_refused() {
-    let (mut w, _, _) = two_depositors();
-    let (_, buyer_usd) = newcomer(&mut w.svm, 0);
-    let p = pool(&w.svm);
-    let c = cover(&w.svm);
-    let burn_for = |d: u64| (d as u128 * p.coin_reserve as u128).div_ceil(p.usd_reserve as u128) as u64;
-    // The most the cover may lose and keep one coin unit per thousand shares.
-    let floor = c.shares.div_ceil(MAX_SHARES_PER_COIN);
-    let most = c.coins - floor;
-    let ok = (most as u128 * p.usd_reserve as u128 / p.coin_reserve as u128) as u64;
-    assert!(burn_for(ok) <= most);
-    let mut too_much = ok + 1;
-    while burn_for(too_much) <= most {
-        too_much += 1;
-    }
-    let err = claim_as_judge(&mut w.svm, buyer_usd, too_much).unwrap_err();
-    assert!(err.contains("CoverTooThin"), "{err}");
-    claim_as_judge(&mut w.svm, buyer_usd, ok).unwrap();
-    let after = cover(&w.svm);
-    assert!(after.coins as u128 * MAX_SHARES_PER_COIN as u128 >= after.shares as u128);
-
-    // And a deposit still works afterwards.
-    let (k, from) = newcomer(&mut w.svm, 1_000_000);
-    try_deposit(&mut w.svm, &k, from, 900_000 * DOLLAR).unwrap();
-    assert_books_balance(&w.svm);
-}
-
-#[test]
-fn a_claim_paid_into_the_pools_own_accounts_is_refused() {
-    let (mut w, _, _) = two_depositors();
-    // The pool's dollar account is already refused as a second mutable copy
-    // of itself; the fee account needs the program's own rule.
-    let err = claim_as_judge(&mut w.svm, pda(&[POOL_USD_SEED]), DOLLAR).unwrap_err();
-    assert!(err.contains("ConstraintDuplicateMutableAccount") || err.contains("NotTheClaimant"), "{err}");
-    let err = claim_as_judge(&mut w.svm, pda(&[FEES_SEED]), DOLLAR).unwrap_err();
-    assert!(err.contains("NotTheClaimant"), "{err}");
 }
 
 #[test]

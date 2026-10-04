@@ -211,10 +211,11 @@ fn an_unanswered_challenge_takes_the_stake() {
     let (anyone, _) = newcomer(&mut w.svm, 0);
     let coins_before = coins(&w.svm, c.pubkey());
     let sol_before = lamports(&w.svm, c.pubkey());
+    let cover_before = cover(&w.svm).coins;
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &anyone).unwrap();
     assert_eq!(coins(&w.svm, c.pubkey()), coins_before + MEMBER_STAKE / 10);
     assert_eq!(lamports(&w.svm, c.pubkey()), sol_before + CHALLENGE_BOND_LAMPORTS);
-    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), MEMBER_STAKE - MEMBER_STAKE / 10);
+    assert_eq!(cover(&w.svm).coins, cover_before + MEMBER_STAKE - MEMBER_STAKE / 10, "nine tenths go into the cover");
     assert_eq!(token_balance(&w.svm, pda(&[sasona::STAKES_SEED])), 0);
     let m = member(&w.svm, 1);
     assert_eq!((m.state, m.stake, m.open_challenges), (MEMBER_SLASHED, 0, 0));
@@ -357,8 +358,9 @@ fn a_member_who_asked_to_leave_still_loses_the_stake() {
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
     try_with(&mut w.svm, |s| ask_to_leave_ix(s, d.pubkey(), 1), &d).unwrap();
     days_pass(&mut w.svm, 8);
+    let cover_before = cover(&w.svm).coins;
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
-    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), MEMBER_STAKE - MEMBER_STAKE / 10);
+    assert_eq!(cover(&w.svm).coins, cover_before + MEMBER_STAKE - MEMBER_STAKE / 10, "nine tenths go into the cover");
     let m = member(&w.svm, 1);
     assert_eq!((m.state, m.stake, m.seat), (MEMBER_SLASHED, 0, 0));
 }
@@ -398,11 +400,12 @@ fn a_second_upheld_challenge_finds_no_stake_left() {
     try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), two), &c).unwrap();
     assert_eq!(member(&w.svm, 1).open_challenges, 2);
     days_pass(&mut w.svm, 8);
+    let cover_before = cover(&w.svm).coins;
     try_with(&mut w.svm, |s| uphold_ix(s, one), &c).unwrap();
     let coins_before = coins(&w.svm, c.pubkey());
     try_with(&mut w.svm, |s| uphold_ix(s, two), &c).unwrap();
     assert_eq!(coins(&w.svm, c.pubkey()), coins_before);
-    assert_eq!(token_balance(&w.svm, pda(&[sasona::HELD_SEED])), MEMBER_STAKE - MEMBER_STAKE / 10);
+    assert_eq!(cover(&w.svm).coins, cover_before + MEMBER_STAKE - MEMBER_STAKE / 10, "nine tenths go into the cover");
     let m = member(&w.svm, 1);
     assert_eq!((m.state, m.open_challenges), (MEMBER_SLASHED, 0));
     let r: Reading = read(&w.svm, two);

@@ -197,10 +197,28 @@ pub const READING_FALSE: u8 = 3;
 pub const QUOTE_SEED: &[u8] = b"quote";
 pub const MAX_QUOTE_BPS: u16 = 10_000;
 
-/// NOTE, temporary: who may approve a claim. Deciding claims belongs to
-/// members drawn at random, which is part 7 of the roadmap. Until then it is
-/// the key that can already upgrade this program, so nothing new is trusted.
-pub const JUDGE: Pubkey = pubkey!("CCsLKV9yCucqYmdb1KarjsTD5pA6q2fzucBa9ozCTSFu");
+/// Purchases and chargebacks (SPEC.md section 7).
+pub const PURCHASE_SEED: &[u8] = b"purchase";
+pub const BOOK_SEED: &[u8] = b"book";
+pub const CHARGEBACK_SEED: &[u8] = b"chargeback";
+pub const SERVICE_SEED: &[u8] = b"service";
+pub const ESCROW_SEED: &[u8] = b"escrow";
+pub const REPLAY_DOMAIN: &[u8] = b"sasona/replay/v1";
+/// The replayer's pay and the deposit: 5% of the price.
+pub const REPLAY_FEE_BPS: u64 = 500;
+/// NOTE, temporary: the smallest price a purchase can be covered at, ten
+/// devnet cents. It bounds what a free first chargeback can cost a member
+/// (7.7), and is set with the stake once purchases show what they are worth.
+pub const MIN_COVERED_PRICE: u64 = 100_000;
+pub const CHARGEBACK_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const FREE_CHARGEBACK_EVERY_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub const REPLAY_END_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const MAX_REPLAY_DRAWS: u8 = 8;
+pub const PURCHASE_OPEN: u8 = 0;
+pub const PURCHASE_CHARGED_BACK: u8 = 1;
+pub const PURCHASE_CLOSED: u8 = 2;
+pub const CHARGEBACK_OPEN: u8 = 0;
+pub const CHARGEBACK_SETTLED: u8 = 1;
 
 #[program]
 pub mod sasona {
@@ -592,7 +610,13 @@ pub mod sasona {
     /// nonce is held by an earlier one cannot be revealed.
     ///
     /// The verdict is checked by anyone holding the reply, against SPEC.md 2.4.
-    pub fn reveal_reading(ctx: Context<RevealReading>, nonce: [u8; 16], reply_hash: [u8; 32], verdict: u8) -> Result<()> {
+    pub fn reveal_reading(
+        ctx: Context<RevealReading>,
+        nonce: [u8; 16],
+        reply_hash: [u8; 32],
+        verdict: u8,
+        pay_to: Pubkey,
+    ) -> Result<()> {
         let r = &mut ctx.accounts.reading;
         require!(r.state == READING_COMMITTED, SasonaError::ReadingNotOpen);
         let now = Clock::get()?.slot;
@@ -617,6 +641,8 @@ pub mod sasona {
         r.verdict = verdict;
         r.reveal_slot = now;
         r.reveal_time = Clock::get()?.unix_timestamp;
+        // SPEC.md 7.1: where the service asks to be paid, as the reader found it.
+        r.pay_to = pay_to;
         r.state = READING_REVEALED;
         emit!(ReadingRevealed { reading: r.key(), reply_hash, verdict, reveal_slot: now });
         Ok(())
@@ -743,6 +769,13 @@ pub mod sasona {
         require!(m.state == MEMBER_LEAVING, SasonaError::NotLeaving);
         require!(Clock::get()?.unix_timestamp >= m.leave_at, SasonaError::NoticeNotOver);
         require!(m.open_challenges == 0, SasonaError::ChallengeOpen);
+        // SPEC.md 4.4 and 7.2: nothing insured still open, nothing owed. The
+        // book is at its own address; empty means this membership never insured.
+        let book = &ctx.accounts.book;
+        if !book.data_is_empty() {
+            let b = Book::try_deserialize(&mut &book.try_borrow_data()?[..])?;
+            require!(b.open_usd == 0 && b.owed_coins == 0, SasonaError::StillInsuring);
+        }
         let stake = m.stake;
 
         let bump = [ctx.accounts.pool.bump];
@@ -845,7 +878,7 @@ pub mod sasona {
 
     /// Uphold a challenge nobody answered in time (SPEC.md 5.3). The reading
     /// stops counting. If the membership still has its stake, it loses all of
-    /// it, a tenth to the challenger and the rest held, and its seat if it
+    /// it, a tenth to the challenger and the rest to the cover, and its seat if it
     /// has one: then the remaining accounts are as for ask_to_leave. Anyone
     /// may send it.
     pub fn uphold_challenge<'info>(ctx: Context<'info, UpholdChallenge<'info>>) -> Result<()> {
@@ -861,7 +894,7 @@ pub mod sasona {
             let seeds: &[&[u8]] = &[POOL_SEED, &bump];
             let signer: &[&[&[u8]]] = &[seeds];
             let a = &ctx.accounts;
-            for (to, amount) in [(a.challenger_coin.to_account_info(), reward), (a.held.to_account_info(), stake - reward)] {
+            for (to, amount) in [(a.challenger_coin.to_account_info(), reward), (a.cover_vault.to_account_info(), stake - reward)] {
                 token::transfer(
                     CpiContext::new(
                         a.token_program.key(),
@@ -871,6 +904,11 @@ pub mod sasona {
                     amount,
                 )?;
             }
+        }
+        if stake > 0 {
+            // SPEC.md 5.3: into the cover, where it pays back what the member owes.
+            let cover = &mut ctx.accounts.cover;
+            cover.coins = cover.coins.checked_add(stake - reward).ok_or(SasonaError::Overflow)?;
         }
         if state == MEMBER_ACTIVE {
             unseat(&mut ctx.accounts.members, &mut ctx.accounts.member, ctx.remaining_accounts)?;
@@ -914,6 +952,370 @@ pub mod sasona {
         q.set_time = clock.unix_timestamp;
         q.bump = ctx.bumps.quote;
         emit!(QuoteSet { reading: q.reading, member: q.member, rate, set_slot: q.set_slot, set_time: q.set_time });
+        Ok(())
+    }
+
+    /// Buy from a listed service, covered by a quote (SPEC.md 7.2). The price
+    /// goes to the address the covering reading recorded, the premium to the
+    /// member who set the quote, and the purchase counts against that
+    /// member's room to insure until it can no longer be charged back.
+    pub fn buy(ctx: Context<Buy>, id: u64, price: u64) -> Result<()> {
+        let r = &ctx.accounts.reading;
+        let clock = Clock::get()?;
+        require!(price >= MIN_COVERED_PRICE, SasonaError::TooSmall);
+        require!(ctx.accounts.quote.rate > 0, SasonaError::NotInsured);
+        require!(r.state == READING_REVEALED, SasonaError::ReadingNotOpen);
+        require!(r.verdict == 1, SasonaError::NotDelivered);
+        require!(r.member > 0, SasonaError::NoMember);
+        require!(r.pay_to != Pubkey::default(), SasonaError::NoPayTo);
+        let ends = r.reveal_time.checked_add(CHALLENGE_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;
+        require!(clock.unix_timestamp <= ends, SasonaError::WindowClosed);
+        let m = &ctx.accounts.member;
+        require!(m.state == MEMBER_ACTIVE, SasonaError::NotActive);
+
+        let fee = replay_fee(price)?;
+        let counted = add(price, fee)?;
+        let premium = u64::try_from(price as u128 * ctx.accounts.quote.rate as u128 / 10_000).map_err(|_| SasonaError::Overflow)?;
+        let pool = &ctx.accounts.pool;
+        let book = &ctx.accounts.book;
+        let room = room_to_insure(m.stake, pool.usd_reserve, pool.coin_reserve, book.open_usd, book.owed_coins)?;
+        require!(counted as i128 <= room, SasonaError::NoRoomToInsure);
+
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.buyer_usd.to_account_info(), to: a.merchant_usd.to_account_info(), authority: a.buyer.to_account_info() },
+            ),
+            price,
+        )?;
+        if premium > 0 {
+            token::transfer(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Transfer { from: a.buyer_usd.to_account_info(), to: a.quoter_usd.to_account_info(), authority: a.buyer.to_account_info() },
+                ),
+                premium,
+            )?;
+        }
+
+        let number = ctx.accounts.member.number;
+        let reading = ctx.accounts.reading.key();
+        let service = solana_sha256_hasher::hashv(&[ctx.accounts.reading.endpoint.as_bytes()]).to_bytes();
+        let due = ends;
+        let b = &mut ctx.accounts.book;
+        b.member = number;
+        b.open_usd = add(b.open_usd, counted)?;
+        b.bump = ctx.bumps.book;
+        let pu = &mut ctx.accounts.purchase;
+        pu.buyer = ctx.accounts.buyer.key();
+        pu.id = id;
+        pu.reading = reading;
+        pu.member = number;
+        pu.service = service;
+        pu.price = price;
+        pu.premium = premium;
+        pu.counted = counted;
+        pu.made_time = clock.unix_timestamp;
+        pu.due_time = due;
+        pu.state = PURCHASE_OPEN;
+        pu.bump = ctx.bumps.purchase;
+        emit!(Bought { purchase: pu.key(), buyer: pu.buyer, reading, price, premium });
+        Ok(())
+    }
+
+    /// Close a purchase whose 7 days to charge back have passed, and give
+    /// its member back the room it took. Anyone may send it.
+    pub fn close_purchase(ctx: Context<ClosePurchase>) -> Result<()> {
+        let pu = &mut ctx.accounts.purchase;
+        require!(pu.state == PURCHASE_OPEN, SasonaError::NotOpen);
+        let ends = pu.made_time.checked_add(CHARGEBACK_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;
+        require!(Clock::get()?.unix_timestamp > ends, SasonaError::NotLapsedYet);
+        pu.state = PURCHASE_CLOSED;
+        let b = &mut ctx.accounts.book;
+        b.open_usd = b.open_usd.checked_sub(pu.counted).ok_or(SasonaError::Overflow)?;
+        Ok(())
+    }
+
+    /// Ask for a purchase's price back, within 7 days of it (SPEC.md 7.3).
+    /// The deposit is 5% of the price, except for the first chargeback on
+    /// the service in 30 days. The first replay is drawn from this slot.
+    pub fn charge_back(ctx: Context<ChargeBack>) -> Result<()> {
+        let clock = Clock::get()?;
+        let pu = &ctx.accounts.purchase;
+        require!(pu.state == PURCHASE_OPEN, SasonaError::NotOpen);
+        let ends = pu.made_time.checked_add(CHARGEBACK_WINDOW_SECONDS).ok_or(SasonaError::Overflow)?;
+        require!(clock.unix_timestamp <= ends, SasonaError::WindowClosed);
+
+        let terms = &mut ctx.accounts.service_terms;
+        terms.bump = ctx.bumps.service_terms;
+        let free = terms.last_free_time == 0
+            || clock.unix_timestamp >= terms.last_free_time.checked_add(FREE_CHARGEBACK_EVERY_SECONDS).ok_or(SasonaError::Overflow)?;
+        let deposit = if free { 0 } else { replay_fee(pu.price)? };
+        if free {
+            terms.last_free_time = clock.unix_timestamp;
+        }
+        if deposit > 0 {
+            let a = &ctx.accounts;
+            token::transfer(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Transfer { from: a.buyer_usd.to_account_info(), to: a.escrow.to_account_info(), authority: a.buyer.to_account_info() },
+                ),
+                deposit,
+            )?;
+        }
+
+        let quoter = ctx.accounts.member.owner;
+        let seated = ctx.accounts.members.seated;
+        let c = &mut ctx.accounts.chargeback;
+        c.purchase = ctx.accounts.purchase.key();
+        c.buyer = ctx.accounts.buyer.key();
+        c.quoter = quoter;
+        c.member = ctx.accounts.purchase.member;
+        c.service = ctx.accounts.purchase.service;
+        c.price = ctx.accounts.purchase.price;
+        c.deposit = deposit;
+        c.made_time = clock.unix_timestamp;
+        c.draw = 0;
+        c.counted_draws = 0;
+        c.draw_slot = clock.slot;
+        c.draw_members = seated;
+        c.seed = [0u8; 32];
+        c.entropy_slot = 0;
+        c.declined = [0u32; MAX_REPLAY_DRAWS as usize];
+        c.state = CHARGEBACK_OPEN;
+        c.bump = ctx.bumps.chargeback;
+        ctx.accounts.purchase.state = PURCHASE_CHARGED_BACK;
+        emit!(ChargedBack { chargeback: c.key(), purchase: c.purchase, deposit, draw_slot: c.draw_slot });
+        Ok(())
+    }
+
+    /// Record the entropy for the chargeback's current draw, once its slot
+    /// is in SlotHashes (SPEC.md 7.4). Anyone may send it; the member drawn
+    /// does it anyway when they commit.
+    pub fn record_draw(ctx: Context<RecordDraw>) -> Result<()> {
+        let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+        let c = &mut ctx.accounts.chargeback;
+        require!(c.state == CHARGEBACK_OPEN, SasonaError::ChallengeClosed);
+        record_entropy(c, &data)?;
+        Ok(())
+    }
+
+    /// Commit to the question for a chargeback's replay (SPEC.md 7.4). Only
+    /// the member whose seat is drawn for it, within the hour. The seats
+    /// drawn before theirs and passed over come in the remaining accounts.
+    pub fn commit_replay<'info>(
+        ctx: Context<'info, CommitReplay<'info>>,
+        endpoint: String,
+        question_hash: [u8; 32],
+    ) -> Result<()> {
+        let now = Clock::get()?.slot;
+        {
+            let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+            let c = &mut ctx.accounts.chargeback;
+            require!(c.state == CHARGEBACK_OPEN, SasonaError::ChallengeClosed);
+            if c.seed == [0u8; 32] {
+                record_entropy(c, &data)?;
+            }
+        }
+        let c = &ctx.accounts.chargeback;
+        let closes = c.entropy_slot.checked_add(READ_WINDOW_SLOTS).ok_or(SasonaError::Overflow)?;
+        require!(now <= closes, SasonaError::WindowClosed);
+        require!(
+            !endpoint.is_empty() && endpoint.len() <= MAX_ENDPOINT_LEN && endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)),
+            SasonaError::BadEndpoint
+        );
+        require!(solana_sha256_hasher::hashv(&[endpoint.as_bytes()]).to_bytes() == c.service, SasonaError::NotTheSameService);
+        let m = &ctx.accounts.member;
+        require_keys_eq!(m.owner, ctx.accounts.reader.key(), SasonaError::NotTheReader);
+        require!(m.state == MEMBER_ACTIVE && ctx.accounts.seat.member == m.number, SasonaError::NotTheSeat);
+        let drawn = replay_drawn(c, ctx.accounts.members.seated, Some((m.seat, &ctx.accounts.seat)), ctx.remaining_accounts)?;
+        require!(drawn == Some(m.number), SasonaError::NotDrawn);
+
+        let key = ctx.accounts.chargeback.key();
+        let r = &mut ctx.accounts.replay;
+        r.round = key;
+        r.endpoint = endpoint;
+        r.reader = ctx.accounts.reader.key();
+        r.question_hash = question_hash;
+        r.commit_slot = now;
+        r.state = READING_COMMITTED;
+        r.bump = ctx.bumps.replay;
+        r.member = ctx.accounts.member.number;
+        emit!(ReadingCommitted { reading: r.key(), round: key, question_hash, commit_slot: now });
+        Ok(())
+    }
+
+    /// Count the chargeback's current draw as declined and draw again
+    /// (SPEC.md 7.4): its hour passed with no replay committed, or one
+    /// committed and never revealed, or its entropy can no longer be read.
+    /// `drawn_seat` is the seat it drew, shown as the first remaining account
+    /// with the seats passed over before it, or 0 if no seat qualified.
+    pub fn pass_draw<'info>(ctx: Context<'info, PassDraw<'info>>, drawn_seat: u32) -> Result<()> {
+        let now = Clock::get()?.slot;
+        let data = ctx.accounts.slot_hashes.try_borrow_data()?;
+        let replay = &ctx.accounts.replay;
+        let c = &mut ctx.accounts.chargeback;
+        require!(c.state == CHARGEBACK_OPEN, SasonaError::ChallengeClosed);
+        require!(c.counted_draws < MAX_REPLAY_DRAWS, SasonaError::ChallengeClosed);
+
+        let mut declined_member = None;
+        if c.seed == [0u8; 32] {
+            match entropy_for(&data, c.draw_slot + ENTROPY_DELAY_SLOTS)? {
+                // It can still be read: record it and use the hour.
+                Entropy::Found(_, _) | Entropy::TooEarly => return err!(SasonaError::TooEarly),
+                // Never recorded while it could be: the draw counts, its seat unknown.
+                Entropy::Gone => {}
+            }
+        } else {
+            let closes = c.entropy_slot.checked_add(READ_WINDOW_SLOTS).ok_or(SasonaError::Overflow)?;
+            require!(now > closes, SasonaError::TooEarly);
+            if !replay.data_is_empty() {
+                let r = Reading::try_deserialize(&mut &replay.try_borrow_data()?[..])?;
+                let lapsed = r.state == READING_LAPSED
+                    || (r.state == READING_COMMITTED && now > r.commit_slot + REVEAL_WINDOW_SLOTS);
+                require!(lapsed, SasonaError::ReplayStands);
+            }
+            let (candidate, skipped) = if drawn_seat == 0 {
+                (None, ctx.remaining_accounts)
+            } else {
+                let info = ctx.remaining_accounts.first().ok_or(SasonaError::NotTheSeat)?;
+                (Some((drawn_seat, seat_at(info, drawn_seat)?)), &ctx.remaining_accounts[1..])
+            };
+            let seated = ctx.accounts.members.seated;
+            declined_member = replay_drawn(c, seated, candidate.as_ref().map(|(k, s)| (*k, s)), skipped)?;
+        }
+
+        let i = c.counted_draws as usize;
+        if let Some(n) = declined_member {
+            c.declined[i] = n;
+        }
+        c.counted_draws += 1;
+        if c.counted_draws < MAX_REPLAY_DRAWS {
+            c.draw = c.draw.checked_add(1).ok_or(SasonaError::Overflow)?;
+            c.draw_slot = now;
+            c.draw_members = ctx.accounts.members.seated;
+            c.seed = [0u8; 32];
+            c.entropy_slot = 0;
+        }
+        emit!(DrawPassed { chargeback: c.key(), counted: c.counted_draws, declined: declined_member.unwrap_or(0) });
+        Ok(())
+    }
+
+    /// Settle a chargeback (SPEC.md 7.5): on its replay's verdict, or, after
+    /// 8 draws or 7 days with no replay, as if it had failed. The cover pays
+    /// the buyer and the replayer, and the member who set the quote owes the
+    /// cover what it burned. Anyone may send it.
+    pub fn settle_chargeback<'info>(ctx: Context<'info, SettleChargeback<'info>>) -> Result<()> {
+        let now = Clock::get()?;
+        let c = &ctx.accounts.chargeback;
+        require!(c.state == CHARGEBACK_OPEN, SasonaError::ChallengeClosed);
+        let replay = &ctx.accounts.replay;
+        let (verdict, replayer) = if replay.data_is_empty() {
+            (None, Pubkey::default())
+        } else {
+            let r = Reading::try_deserialize(&mut &replay.try_borrow_data()?[..])?;
+            if r.state == READING_REVEALED { (Some(r.verdict), r.reader) } else { (None, Pubkey::default()) }
+        };
+        if verdict.is_none() {
+            let ended = c.counted_draws >= MAX_REPLAY_DRAWS
+                || now.unix_timestamp > c.made_time.checked_add(REPLAY_END_SECONDS).ok_or(SasonaError::Overflow)?;
+            require!(ended, SasonaError::NotLapsedYet);
+        }
+        let (price, deposit) = (c.price, c.deposit);
+        let fee = replay_fee(price)?;
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let mut burned: u64 = 0;
+        let a = &mut *ctx.accounts;
+        match verdict {
+            Some(1) if deposit > 0 => {
+                let to = replayer_account(a, replayer)?;
+                token::transfer(
+                    CpiContext::new(a.token_program.key(), Transfer { from: a.escrow.to_account_info(), to, authority: a.pool.to_account_info() })
+                        .with_signer(signer),
+                    deposit,
+                )?;
+            }
+            Some(1) => {
+                let to = replayer_account(a, replayer)?;
+                burned = add(burned, pay_from_cover(a, to, fee, signer)?)?;
+            }
+            _ => {
+                let buyer = a.buyer_usd.to_account_info();
+                burned = add(burned, pay_from_cover(a, buyer.clone(), price, signer)?)?;
+                if verdict.is_some() {
+                    let to = replayer_account(a, replayer)?;
+                    burned = add(burned, pay_from_cover(a, to, fee, signer)?)?;
+                }
+                if deposit > 0 {
+                    token::transfer(
+                        CpiContext::new(a.token_program.key(), Transfer { from: a.escrow.to_account_info(), to: buyer, authority: a.pool.to_account_info() })
+                            .with_signer(signer),
+                        deposit,
+                    )?;
+                }
+            }
+        }
+
+        a.coin_mint.reload()?;
+        a.pool_usd.reload()?;
+        a.cover_vault.reload()?;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        a.cover.check(a.cover_vault.amount)?;
+
+        let counted = a.purchase.counted;
+        a.purchase.state = PURCHASE_CLOSED;
+        let b = &mut a.book;
+        b.open_usd = b.open_usd.checked_sub(counted).ok_or(SasonaError::Overflow)?;
+        b.owed_coins = add(b.owed_coins, burned)?;
+        let c = &mut a.chargeback;
+        c.state = CHARGEBACK_SETTLED;
+        c.owed_coins = burned;
+        c.due_time = a.purchase.due_time;
+        emit!(ChargebackSettled { chargeback: c.key(), verdict: verdict.unwrap_or(0), paid_back: if verdict == Some(1) { 0 } else { price }, owed_coins: burned });
+        Ok(())
+    }
+
+    /// Take what a member owes the cover out of their stake, once the reading
+    /// that covered the purchase can no longer be challenged (SPEC.md 7.5).
+    /// Anyone may send it.
+    pub fn repay_cover(ctx: Context<RepayCover>) -> Result<()> {
+        let c = &ctx.accounts.chargeback;
+        require!(c.state == CHARGEBACK_SETTLED && c.owed_coins > 0, SasonaError::NothingOwed);
+        require!(Clock::get()?.unix_timestamp > c.due_time, SasonaError::NotLapsedYet);
+        let owed = c.owed_coins;
+        let m = &ctx.accounts.member;
+        let take = if m.state == MEMBER_ACTIVE || m.state == MEMBER_LEAVING { owed.min(m.stake) } else { 0 };
+        if take > 0 {
+            let bump = [ctx.accounts.pool.bump];
+            let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+            let signer: &[&[&[u8]]] = &[seeds];
+            let a = &ctx.accounts;
+            token::transfer(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Transfer { from: a.stakes.to_account_info(), to: a.cover_vault.to_account_info(), authority: a.pool.to_account_info() },
+                )
+                .with_signer(signer),
+                take,
+            )?;
+        }
+        let m = &mut ctx.accounts.member;
+        m.stake -= take;
+        let cover = &mut ctx.accounts.cover;
+        cover.coins = add(cover.coins, take)?;
+        // What the stake could not cover, because a challenge took it first,
+        // went into the cover with that stake (5.3); the debt ends here.
+        let b = &mut ctx.accounts.book;
+        b.owed_coins = b.owed_coins.saturating_sub(owed);
+        ctx.accounts.chargeback.owed_coins = 0;
+        ctx.accounts.cover_vault.reload()?;
+        ctx.accounts.cover.check(ctx.accounts.cover_vault.amount)?;
+        emit!(CoverRepaid { chargeback: ctx.accounts.chargeback.key(), owed, taken: take });
         Ok(())
     }
 
@@ -967,80 +1369,6 @@ pub mod sasona {
         let a = &ctx.accounts;
         a.cover.check(a.cover_vault.amount)?;
         emit!(JoinedCover { owner: a.owner.key(), coins, shares });
-        Ok(())
-    }
-
-    /// Pay a buyer back out of the cover.
-    ///
-    /// The dollars leave the pool, and two equal amounts of coin are burned:
-    /// the pool's side, so the price does not fall, and the cover's, because
-    /// the guarantees are what paid. It undoes, for this many dollars, what a
-    /// deposit's guarantee slice did. `reference` names the purchase.
-    pub fn claim(ctx: Context<Claim>, dollars: u64, reference: [u8; 32]) -> Result<()> {
-        require_keys_eq!(ctx.accounts.judge.key(), JUDGE, SasonaError::NotTheJudge);
-        require!(dollars > 0, SasonaError::NothingDeposited);
-
-        let (usd, coins) = (ctx.accounts.pool.usd_reserve, ctx.accounts.pool.coin_reserve);
-        require!(dollars < usd, SasonaError::MoreThanIsThere);
-        // Rounded up, so the pool gives up at least the coins behind the
-        // dollars and the price can only rise.
-        let burn = u64::try_from((dollars as u128 * coins as u128).div_ceil(usd as u128))
-            .map_err(|_| SasonaError::Overflow)?;
-        // The cover never empties, and never gets so thin that new shares
-        // would overflow; see MAX_SHARES_PER_COIN.
-        let cover = &ctx.accounts.cover;
-        require!(burn < coins && burn < cover.coins, SasonaError::MoreThanIsThere);
-        require!(
-            (cover.coins - burn) as u128 * MAX_SHARES_PER_COIN as u128 >= cover.shares as u128,
-            SasonaError::CoverTooThin
-        );
-
-        let bump = [ctx.accounts.pool.bump];
-        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
-        let signer: &[&[&[u8]]] = &[seeds];
-        let a = &ctx.accounts;
-        token::transfer(
-            CpiContext::new(
-                a.token_program.key(),
-                Transfer {
-                    from: a.pool_usd.to_account_info(),
-                    to: a.claimant_usd.to_account_info(),
-                    authority: a.pool.to_account_info(),
-                },
-            )
-            .with_signer(signer),
-            dollars,
-        )?;
-        for from in [a.pool_coin.to_account_info(), a.cover_vault.to_account_info()] {
-            token::burn(
-                CpiContext::new(
-                    a.token_program.key(),
-                    Burn { mint: a.coin_mint.to_account_info(), from, authority: a.pool.to_account_info() },
-                )
-                .with_signer(signer),
-                burn,
-            )?;
-        }
-
-        let pool = &mut ctx.accounts.pool;
-        pool.usd_reserve = usd - dollars;
-        pool.coin_reserve = coins - burn;
-        pool.outside = pool.outside.checked_sub(burn).ok_or(SasonaError::Overflow)?;
-        require!(
-            pool.usd_reserve as u128 * coins as u128 >= usd as u128 * pool.coin_reserve as u128,
-            SasonaError::PriceMoved
-        );
-        let cover = &mut ctx.accounts.cover;
-        cover.coins -= burn;
-
-        ctx.accounts.coin_mint.reload()?;
-        ctx.accounts.pool_usd.reload()?;
-        ctx.accounts.cover_vault.reload()?;
-        let a = &ctx.accounts;
-        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
-        a.cover.check(a.cover_vault.amount)?;
-
-        emit!(Claimed { claimant: a.claimant_usd.owner, dollars, coins_burned: burn.saturating_mul(2), reference });
         Ok(())
     }
 
@@ -1287,6 +1615,127 @@ pub fn expected_answer(nonce: &[u8; 16]) -> [u8; 16] {
         expect[2 * i + 1] = HEX[(b & 15) as usize];
     }
     expect
+}
+
+/// SPEC.md 7.4: the replayer's pay, and the deposit.
+pub fn replay_fee(price: u64) -> Result<u64> {
+    u64::try_from(price as u128 * REPLAY_FEE_BPS as u128 / 10_000).map_err(|_| error!(SasonaError::Overflow))
+}
+
+/// SPEC.md 7.2: a member's room to insure, in dollar units: the stake valued
+/// at the pool's price (rounded down), less what open purchases could cost,
+/// less what is owed (valued the same way, rounded up).
+pub fn room_to_insure(stake: u64, usd_reserve: u64, coin_reserve: u64, open_usd: u64, owed_coins: u64) -> Result<i128> {
+    require!(coin_reserve > 0, SasonaError::Overflow);
+    let stake_usd = stake as i128 * usd_reserve as i128 / coin_reserve as i128;
+    let owed_usd = (owed_coins as i128 * usd_reserve as i128 + coin_reserve as i128 - 1) / coin_reserve as i128;
+    Ok(stake_usd - open_usd as i128 - owed_usd)
+}
+
+/// SPEC.md 7.4: the seed a chargeback's current draw is drawn with.
+pub fn replay_seed(chargeback: &Pubkey, draw: u32, entropy: &[u8; 32]) -> [u8; 32] {
+    solana_sha256_hasher::hashv(&[REPLAY_DOMAIN, chargeback.as_ref(), &draw.to_be_bytes(), entropy]).to_bytes()
+}
+
+/// Fix the chargeback's current draw from SlotHashes, if its slot is there.
+fn record_entropy(c: &mut Account<Chargeback>, slot_hashes: &[u8]) -> Result<()> {
+    require!(c.seed == [0u8; 32], SasonaError::AlreadySettled);
+    let target = c.draw_slot.checked_add(ENTROPY_DELAY_SLOTS).ok_or(SasonaError::Overflow)?;
+    match entropy_for(slot_hashes, target)? {
+        Entropy::Found(slot, hash) => {
+            c.entropy_slot = slot;
+            c.seed = replay_seed(&c.key(), c.draw as u32, &hash);
+            Ok(())
+        }
+        Entropy::TooEarly => err!(SasonaError::TooEarly),
+        Entropy::Gone => err!(SasonaError::TooLate),
+    }
+}
+
+/// SPEC.md 7.4: follow a chargeback's current draw. `candidate` is the seat
+/// someone says was drawn; `skipped` are the seats drawn before it that
+/// exist now, in order, each of which must not qualify. Returns the
+/// membership in the candidate seat, or None when no seat qualifies and
+/// every one drawn was shown.
+fn replay_drawn(c: &Chargeback, seated: u32, candidate: Option<(u32, &Seat)>, skipped: &[AccountInfo]) -> Result<Option<u32>> {
+    require!(c.seed != [0u8; 32], SasonaError::TooEarly);
+    require!(c.draw_members > 0 || candidate.is_none(), SasonaError::NotDrawn);
+    let declined = &c.declined[..c.counted_draws as usize];
+    let qualifies = |s: &Seat| {
+        s.since < c.draw_slot && s.owner != c.buyer && s.owner != c.quoter && !declined.contains(&s.member)
+    };
+    let mut shown = 0usize;
+    if c.draw_members > 0 {
+        for attempt in 0..MAX_READER_ATTEMPTS {
+            let k = reader_number(&c.seed, &c.service, attempt, c.draw_members);
+            if k > seated {
+                continue;
+            }
+            if let Some((ck, cs)) = candidate {
+                if k == ck {
+                    require!(qualifies(cs), SasonaError::NotDrawn);
+                    require!(shown == skipped.len(), SasonaError::NotDrawn);
+                    return Ok(Some(cs.member));
+                }
+            }
+            let info = skipped.get(shown).ok_or(SasonaError::NotSkippable)?;
+            shown += 1;
+            let s = seat_at(info, k)?;
+            require!(!qualifies(&s), SasonaError::NotSkippable);
+        }
+    }
+    require!(candidate.is_none() && shown == skipped.len(), SasonaError::NotDrawn);
+    Ok(None)
+}
+
+/// The replayer's dollar account, which must be theirs.
+fn replayer_account<'info>(a: &SettleChargeback<'info>, replayer: Pubkey) -> Result<AccountInfo<'info>> {
+    let acc = a.replayer_usd.as_ref().ok_or(SasonaError::NotTheReader)?;
+    require_keys_eq!(acc.owner, replayer, SasonaError::NotTheReader);
+    Ok(acc.to_account_info())
+}
+
+/// Pay `dollars` to `to` out of the cover, as a claim (part 1): dollars leave
+/// the pool, and equal coin is burned from the pool and from the cover, so
+/// the price does not fall. Returns the coin burned from the cover.
+fn pay_from_cover<'info>(a: &mut SettleChargeback<'info>, to: AccountInfo<'info>, dollars: u64, signer: &[&[&[u8]]]) -> Result<u64> {
+    if dollars == 0 {
+        return Ok(0);
+    }
+    let (usd, coins) = (a.pool.usd_reserve, a.pool.coin_reserve);
+    require!(dollars < usd, SasonaError::MoreThanIsThere);
+    // Rounded up, so the pool gives up at least the coins behind the
+    // dollars and the price can only rise.
+    let burn = u64::try_from((dollars as u128 * coins as u128).div_ceil(usd as u128)).map_err(|_| SasonaError::Overflow)?;
+    // The cover never empties, and never gets so thin that new shares would
+    // overflow; see MAX_SHARES_PER_COIN.
+    require!(burn < coins && burn < a.cover.coins, SasonaError::MoreThanIsThere);
+    require!(
+        (a.cover.coins - burn) as u128 * MAX_SHARES_PER_COIN as u128 >= a.cover.shares as u128,
+        SasonaError::CoverTooThin
+    );
+    token::transfer(
+        CpiContext::new(a.token_program.key(), Transfer { from: a.pool_usd.to_account_info(), to, authority: a.pool.to_account_info() })
+            .with_signer(signer),
+        dollars,
+    )?;
+    for from in [a.pool_coin.to_account_info(), a.cover_vault.to_account_info()] {
+        token::burn(
+            CpiContext::new(a.token_program.key(), Burn { mint: a.coin_mint.to_account_info(), from, authority: a.pool.to_account_info() })
+                .with_signer(signer),
+            burn,
+        )?;
+    }
+    let pool = &mut a.pool;
+    pool.usd_reserve = usd - dollars;
+    pool.coin_reserve = coins - burn;
+    pool.outside = pool.outside.checked_sub(burn).ok_or(SasonaError::Overflow)?;
+    require!(
+        pool.usd_reserve as u128 * coins as u128 >= usd as u128 * pool.coin_reserve as u128,
+        SasonaError::PriceMoved
+    );
+    a.cover.coins -= burn;
+    Ok(burn)
 }
 
 /// sasona-protocol SPEC.md 3.3: what a pair settles, from its two verdicts.
@@ -1791,44 +2240,6 @@ pub struct JoinCover<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Claim<'info> {
-    pub judge: Signer<'info>,
-
-    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut, address = pool.coin_mint)]
-    pub coin_mint: Account<'info, Mint>,
-
-    #[account(address = pool.usd_mint @ SasonaError::NotTheDollar)]
-    pub usd_mint: Account<'info, Mint>,
-
-    #[account(mut, seeds = [POOL_USD_SEED], bump)]
-    pub pool_usd: Account<'info, TokenAccount>,
-
-    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
-    pub pool_coin: Account<'info, TokenAccount>,
-
-    #[account(seeds = [FEES_SEED], bump)]
-    pub fees: Account<'info, TokenAccount>,
-
-    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
-    pub cover: Account<'info, Cover>,
-
-    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
-    pub cover_vault: Account<'info, TokenAccount>,
-
-    /// The buyer being paid back, in the pool's dollar. Never one of the
-    /// pool's own accounts, where the dollars would sit unrecorded.
-    #[account(mut, token::mint = usd_mint,
-              constraint = claimant_usd.key() != pool_usd.key() @ SasonaError::NotTheClaimant,
-              constraint = claimant_usd.key() != fees.key() @ SasonaError::NotTheClaimant)]
-    pub claimant_usd: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
 pub struct RequestRelease<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -1950,6 +2361,10 @@ pub struct Leave<'info> {
     #[account(mut, token::mint = coin_mint, token::authority = owner)]
     pub owner_coin: Account<'info, TokenAccount>,
 
+    /// CHECK: this membership's book, at its own address; read in `leave`.
+    #[account(seeds = [BOOK_SEED, member.number.to_le_bytes().as_ref()], bump)]
+    pub book: UncheckedAccount<'info>,
+
     pub token_program: Program<'info, Token>,
 }
 
@@ -2042,8 +2457,11 @@ pub struct UpholdChallenge<'info> {
     #[account(mut, seeds = [STAKES_SEED], bump)]
     pub stakes: Account<'info, TokenAccount>,
 
-    #[account(mut, seeds = [HELD_SEED], bump)]
-    pub held: Account<'info, TokenAccount>,
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
 
     /// CHECK: the challenger, who gets the bond back. Only lamports move.
     #[account(mut, address = challenge.challenger @ SasonaError::NotTheChallenger)]
@@ -2071,6 +2489,230 @@ pub struct SetQuote<'info> {
     pub quote: Account<'info, Quote>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(id: u64)]
+pub struct Buy<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = buyer)]
+    pub buyer_usd: Account<'info, TokenAccount>,
+
+    #[account(address = USD_MINT @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    /// The reading whose quote covers the purchase.
+    pub reading: Account<'info, Reading>,
+
+    #[account(seeds = [QUOTE_SEED, reading.key().as_ref()], bump = quote.bump)]
+    pub quote: Account<'info, Quote>,
+
+    /// The member who set the quote.
+    #[account(seeds = [MEMBER_SEED, reading.member.to_le_bytes().as_ref()], bump = member.bump)]
+    pub member: Account<'info, Member>,
+
+    #[account(init_if_needed, payer = buyer, space = 8 + Book::INIT_SPACE,
+              seeds = [BOOK_SEED, reading.member.to_le_bytes().as_ref()], bump)]
+    pub book: Account<'info, Book>,
+
+    #[account(init, payer = buyer, space = 8 + Purchase::INIT_SPACE,
+              seeds = [PURCHASE_SEED, buyer.key().as_ref(), id.to_le_bytes().as_ref()], bump)]
+    pub purchase: Account<'info, Purchase>,
+
+    /// Where the service asks to be paid, as its reading recorded (7.1).
+    #[account(mut, token::mint = usd_mint, constraint = merchant_usd.owner == reading.pay_to @ SasonaError::NotThePayTo)]
+    pub merchant_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = usd_mint, constraint = quoter_usd.owner == member.owner @ SasonaError::NotTheOwner)]
+    pub quoter_usd: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClosePurchase<'info> {
+    #[account(mut, seeds = [PURCHASE_SEED, purchase.buyer.as_ref(), purchase.id_bytes().as_ref()], bump = purchase.bump)]
+    pub purchase: Account<'info, Purchase>,
+
+    #[account(mut, seeds = [BOOK_SEED, purchase.member.to_le_bytes().as_ref()], bump = book.bump)]
+    pub book: Account<'info, Book>,
+}
+
+#[derive(Accounts)]
+pub struct ChargeBack<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = buyer)]
+    pub buyer_usd: Account<'info, TokenAccount>,
+
+    #[account(address = USD_MINT @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, has_one = buyer @ SasonaError::NotTheOwner)]
+    pub purchase: Account<'info, Purchase>,
+
+    /// The member who set the quote, whose key the draw passes over.
+    #[account(seeds = [MEMBER_SEED, purchase.member.to_le_bytes().as_ref()], bump = member.bump)]
+    pub member: Account<'info, Member>,
+
+    #[account(seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
+
+    #[account(init_if_needed, payer = buyer, space = 8 + ServiceTerms::INIT_SPACE,
+              seeds = [SERVICE_SEED, purchase.service.as_ref()], bump)]
+    pub service_terms: Account<'info, ServiceTerms>,
+
+    #[account(init, payer = buyer, space = 8 + Chargeback::INIT_SPACE,
+              seeds = [CHARGEBACK_SEED, purchase.key().as_ref()], bump)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    /// Where deposits wait for their chargeback to settle.
+    #[account(init_if_needed, payer = buyer, seeds = [ESCROW_SEED], bump,
+              token::mint = usd_mint, token::authority = pool)]
+    pub escrow: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RecordDraw<'info> {
+    #[account(mut, seeds = [CHARGEBACK_SEED, chargeback.purchase.as_ref()], bump = chargeback.bump)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    /// CHECK: the SlotHashes sysvar, read by hand.
+    #[account(address = SLOT_HASHES_ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CommitReplay<'info> {
+    #[account(mut)]
+    pub reader: Signer<'info>,
+
+    #[account(mut, seeds = [CHARGEBACK_SEED, chargeback.purchase.as_ref()], bump = chargeback.bump)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    #[account(seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
+
+    #[account(seeds = [MEMBER_SEED, member.number.to_le_bytes().as_ref()], bump = member.bump)]
+    pub member: Account<'info, Member>,
+
+    #[account(seeds = [SEAT_SEED, member.seat.to_le_bytes().as_ref()], bump = seat.bump)]
+    pub seat: Account<'info, Seat>,
+
+    #[account(init, payer = reader, space = 8 + Reading::INIT_SPACE,
+              seeds = [READING_SEED, chargeback.key().as_ref(), &[chargeback.draw]], bump)]
+    pub replay: Account<'info, Reading>,
+
+    /// CHECK: the SlotHashes sysvar, read by hand.
+    #[account(address = SLOT_HASHES_ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PassDraw<'info> {
+    #[account(mut, seeds = [CHARGEBACK_SEED, chargeback.purchase.as_ref()], bump = chargeback.bump)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    #[account(seeds = [MEMBERS_SEED], bump = members.bump)]
+    pub members: Account<'info, Members>,
+
+    /// CHECK: the current draw's replay, at its own address; empty if none was committed.
+    #[account(seeds = [READING_SEED, chargeback.key().as_ref(), &[chargeback.draw]], bump)]
+    pub replay: UncheckedAccount<'info>,
+
+    /// CHECK: the SlotHashes sysvar, read by hand.
+    #[account(address = SLOT_HASHES_ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleChargeback<'info> {
+    #[account(mut, seeds = [CHARGEBACK_SEED, purchase.key().as_ref()], bump = chargeback.bump, has_one = purchase)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    #[account(mut)]
+    pub purchase: Account<'info, Purchase>,
+
+    #[account(mut, seeds = [BOOK_SEED, purchase.member.to_le_bytes().as_ref()], bump = book.bump)]
+    pub book: Account<'info, Book>,
+
+    /// CHECK: the current draw's replay, at its own address; empty if none was committed.
+    #[account(seeds = [READING_SEED, chargeback.key().as_ref(), &[chargeback.draw]], bump)]
+    pub replay: UncheckedAccount<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [ESCROW_SEED], bump)]
+    pub escrow: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = pool.usd_mint, constraint = buyer_usd.owner == chargeback.buyer @ SasonaError::NotTheOwner)]
+    pub buyer_usd: Account<'info, TokenAccount>,
+
+    /// The replayer's dollar account, when there was a replay.
+    #[account(mut, token::mint = pool.usd_mint)]
+    pub replayer_usd: Option<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RepayCover<'info> {
+    #[account(mut, seeds = [CHARGEBACK_SEED, chargeback.purchase.as_ref()], bump = chargeback.bump)]
+    pub chargeback: Account<'info, Chargeback>,
+
+    #[account(mut, seeds = [BOOK_SEED, chargeback.member.to_le_bytes().as_ref()], bump = book.bump)]
+    pub book: Account<'info, Book>,
+
+    #[account(mut, seeds = [MEMBER_SEED, chargeback.member.to_le_bytes().as_ref()], bump = member.bump)]
+    pub member: Account<'info, Member>,
+
+    #[account(seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, seeds = [STAKES_SEED], bump)]
+    pub stakes: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 // --------------------------------------------------------------------- state
@@ -2193,6 +2835,8 @@ pub struct Reading {
     pub member: u32,
     /// When it was revealed, for the 30 days it can be challenged.
     pub reveal_time: i64,
+    /// The address its service asks to be paid at (SPEC.md 7.1).
+    pub pay_to: Pubkey,
 }
 
 /// How many memberships have ever been taken, and how many seats the roster
@@ -2253,6 +2897,81 @@ pub struct Quote {
     pub rate: u16,
     pub set_slot: u64,
     pub set_time: i64,
+    pub bump: u8,
+}
+
+/// What one membership has insured and owes (SPEC.md 7.2, 7.5).
+#[account]
+#[derive(InitSpace)]
+pub struct Book {
+    pub member: u32,
+    /// What the purchases still open could cost, in dollar units.
+    pub open_usd: u64,
+    /// Coin the cover burned on chargebacks, not yet taken from the stake.
+    pub owed_coins: u64,
+    pub bump: u8,
+}
+
+/// A covered purchase (SPEC.md 7.2).
+#[account]
+#[derive(InitSpace)]
+pub struct Purchase {
+    pub buyer: Pubkey,
+    pub id: u64,
+    pub reading: Pubkey,
+    pub member: u32,
+    pub service: [u8; 32],
+    pub price: u64,
+    pub premium: u64,
+    pub counted: u64,
+    pub made_time: i64,
+    /// When the covering reading can no longer be challenged.
+    pub due_time: i64,
+    pub state: u8,
+    pub bump: u8,
+}
+
+impl Purchase {
+    pub fn id_bytes(&self) -> [u8; 8] {
+        self.id.to_le_bytes()
+    }
+}
+
+/// When a service last had a chargeback that needed no deposit.
+#[account]
+#[derive(InitSpace)]
+pub struct ServiceTerms {
+    pub last_free_time: i64,
+    pub bump: u8,
+}
+
+/// A chargeback and its replay draws (SPEC.md 7.3 to 7.5).
+#[account]
+#[derive(InitSpace)]
+pub struct Chargeback {
+    pub purchase: Pubkey,
+    pub buyer: Pubkey,
+    pub quoter: Pubkey,
+    pub member: u32,
+    pub service: [u8; 32],
+    pub price: u64,
+    pub deposit: u64,
+    pub made_time: i64,
+    /// The current draw's number, from 0.
+    pub draw: u8,
+    /// Draws that counted as declined (7.4).
+    pub counted_draws: u8,
+    pub draw_slot: u64,
+    pub draw_members: u32,
+    /// The current draw's seed, zero until its entropy is recorded.
+    pub seed: [u8; 32],
+    pub entropy_slot: u64,
+    /// Memberships whose draw counted as declined, passed over after.
+    pub declined: [u32; 8],
+    pub state: u8,
+    /// Coin the cover burned on settling, owed by the member who set the quote.
+    pub owed_coins: u64,
+    pub due_time: i64,
     pub bump: u8,
 }
 
@@ -2416,6 +3135,45 @@ pub struct ReadingRevealed {
 }
 
 #[event]
+pub struct Bought {
+    pub purchase: Pubkey,
+    pub buyer: Pubkey,
+    pub reading: Pubkey,
+    pub price: u64,
+    pub premium: u64,
+}
+
+#[event]
+pub struct ChargedBack {
+    pub chargeback: Pubkey,
+    pub purchase: Pubkey,
+    pub deposit: u64,
+    pub draw_slot: u64,
+}
+
+#[event]
+pub struct DrawPassed {
+    pub chargeback: Pubkey,
+    pub counted: u8,
+    pub declined: u32,
+}
+
+#[event]
+pub struct ChargebackSettled {
+    pub chargeback: Pubkey,
+    pub verdict: u8,
+    pub paid_back: u64,
+    pub owed_coins: u64,
+}
+
+#[event]
+pub struct CoverRepaid {
+    pub chargeback: Pubkey,
+    pub owed: u64,
+    pub taken: u64,
+}
+
+#[event]
 pub struct QuoteSet {
     pub reading: Pubkey,
     pub member: u32,
@@ -2503,14 +3261,6 @@ pub struct JoinedCover {
     pub owner: Pubkey,
     pub coins: u64,
     pub shares: u64,
-}
-
-#[event]
-pub struct Claimed {
-    pub claimant: Pubkey,
-    pub dollars: u64,
-    pub coins_burned: u64,
-    pub reference: [u8; 32],
 }
 
 #[event]
@@ -2752,6 +3502,22 @@ pub enum SasonaError {
     BadRate,
     #[msg("Only a reading that says delivered can be insured")]
     NotDelivered,
+    #[msg("No quote stands on this reading")]
+    NotInsured,
+    #[msg("This reading recorded no address for its service to be paid at")]
+    NoPayTo,
+    #[msg("A covered purchase is paid to the address its reading recorded")]
+    NotThePayTo,
+    #[msg("The member who set the quote has no room left to insure this")]
+    NoRoomToInsure,
+    #[msg("This purchase is not open")]
+    NotOpen,
+    #[msg("The replay was revealed, or can still be")]
+    ReplayStands,
+    #[msg("Nothing is owed on this chargeback")]
+    NothingOwed,
+    #[msg("This membership has purchases open or owes the cover")]
+    StillInsuring,
     #[msg("Arithmetic overflow")]
     Overflow,
 }
