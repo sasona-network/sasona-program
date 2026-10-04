@@ -248,6 +248,30 @@ fn look_alike_pool_accounts_are_refused_when_settling() {
 }
 
 #[test]
+fn a_coin_of_their_own_is_refused() {
+    // A mint the caller made, with whatever supply they like, passed where
+    // the pool's coin belongs.
+    let mut w = opened();
+    let (k, from) = newcomer(&mut w.svm, 1_000);
+    let fake = Address::new_unique();
+    put_mint(&mut w.svm, fake, k.pubkey(), 6);
+    for (name, mut ix) in [
+        ("pay_fee", pay_fee_ix(k.pubkey(), usd(), from, DOLLAR)),
+        ("settle", settle_ix(k.pubkey())),
+        ("deposit", deposit_ix(k.pubkey(), usd(), from, 100 * DOLLAR)),
+        ("add_depth", add_depth_ix(k.pubkey(), usd(), from, DOLLAR)),
+    ] {
+        ix.accounts[2].pubkey = fake;
+        w.svm.expire_blockhash();
+        let err = send(&mut w.svm, ix, &[&k]).unwrap_err();
+        // A deposit creates the depositor's coin account first, which fails
+        // against the fake mint before addresses are compared.
+        let expected = err.contains("ConstraintAddress") || (name == "deposit" && err.contains("MissingAccount"));
+        assert!(expected, "{name}: {err}");
+    }
+}
+
+#[test]
 fn nobody_can_take_the_networks_coin() {
     let mut w = opened();
     let (k, from) = newcomer(&mut w.svm, 100);

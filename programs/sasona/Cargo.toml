@@ -35,6 +35,7 @@ solana-account = "4"
 solana-program-pack = "3"
 spl-token-interface = "2"
 spl-associated-token-account-interface = "2"
+solana-clock = "3.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

@@ -25,7 +25,7 @@ fn a_newcomer_deposits_at_the_pool_price() {
     assert_eq!(after.usd_reserve, before.usd_reserve + s.rest);
     assert_eq!(after.fees_held, before.fees_held + s.fee);
     assert_eq!(token_balance(&w.svm, ata(k.pubkey(), coin)), s.free * PRICE);
-    assert_eq!(token_balance(&w.svm, pda(&[VAULT_SEED, k.pubkey().as_ref()])), s.guarantee * PRICE);
+    assert_eq!(shares_of(&w.svm, k.pubkey()), s.guarantee * PRICE, "no claims yet, so a share is still one coin");
     assert_eq!(token_balance(&w.svm, from), 900 * DOLLAR);
 
     // The ratio is exactly where it was.
@@ -34,7 +34,7 @@ fn a_newcomer_deposits_at_the_pool_price() {
 
     let g: Guarantee = read(&w.svm, pda(&[GUARANTEE_SEED, k.pubkey().as_ref()]));
     assert_eq!(addr(g.owner), k.pubkey());
-    assert_eq!(g.coins, s.guarantee * PRICE);
+    assert_eq!(g.shares, s.guarantee * PRICE);
     assert_books_balance(&w.svm);
 }
 
@@ -45,9 +45,13 @@ fn depositing_again_adds_to_the_same_guarantee() {
     for amount in [100 * DOLLAR, 37 * DOLLAR + 1, 250 * DOLLAR] {
         try_deposit(&mut w.svm, &k, from, amount).unwrap();
     }
-    let vault = pda(&[VAULT_SEED, k.pubkey().as_ref()]);
-    let g: Guarantee = read(&w.svm, pda(&[GUARANTEE_SEED, k.pubkey().as_ref()]));
-    assert_eq!(g.coins, token_balance(&w.svm, vault));
+    let expected: u64 = [100 * DOLLAR, 37 * DOLLAR + 1, 250 * DOLLAR]
+        .iter()
+        .map(|a| Slices::of(*a).unwrap().guarantee * PRICE)
+        .sum();
+    assert_eq!(shares_of(&w.svm, k.pubkey()), expected);
+    let c = cover(&w.svm);
+    assert_eq!(c.coins, token_balance(&w.svm, pda(&[COVER_VAULT_SEED])));
     assert_books_balance(&w.svm);
 }
 
@@ -59,7 +63,7 @@ fn the_opener_can_deposit_again() {
     let before: Guarantee = read(&w.svm, pda(&[GUARANTEE_SEED, d.pubkey().as_ref()]));
     try_deposit(&mut w.svm, &d, from, 100 * DOLLAR).unwrap();
     let after: Guarantee = read(&w.svm, pda(&[GUARANTEE_SEED, d.pubkey().as_ref()]));
-    assert_eq!(after.coins, before.coins + Slices::of(100 * DOLLAR).unwrap().guarantee * PRICE);
+    assert_eq!(after.shares, before.shares + Slices::of(100 * DOLLAR).unwrap().guarantee * PRICE);
     assert_books_balance(&w.svm);
 }
 
@@ -208,9 +212,8 @@ fn nobody_can_deposit_into_someone_elses_guarantee() {
     let (k, from) = newcomer(&mut w.svm, 1_000);
     let opener = w.depositor.pubkey();
     let mut ix = deposit_ix(k.pubkey(), usd(), from, 100 * DOLLAR);
-    // Swap in the opener's vault and guarantee record.
-    ix.accounts[9].pubkey = pda(&[VAULT_SEED, opener.as_ref()]);
-    ix.accounts[10].pubkey = pda(&[GUARANTEE_SEED, opener.as_ref()]);
+    // Swap in the opener's guarantee record.
+    ix.accounts[12].pubkey = pda(&[GUARANTEE_SEED, opener.as_ref()]);
     w.svm.expire_blockhash();
     let err = send(&mut w.svm, ix, &[&k]).unwrap_err();
     assert!(err.contains("ConstraintSeeds"), "{err}");
@@ -292,7 +295,7 @@ fn the_guarantee_still_cannot_be_taken_back() {
     let (k, from) = newcomer(&mut w.svm, 1_000);
     try_deposit(&mut w.svm, &k, from, 100 * DOLLAR).unwrap();
     let coin = pda(&[COIN_SEED]);
-    let vault = pda(&[VAULT_SEED, k.pubkey().as_ref()]);
+    let vault = pda(&[COVER_VAULT_SEED]);
     let ix = spl_token_interface::instruction::transfer(&token_program(), &vault, &ata(k.pubkey(), coin), &k.pubkey(), &[], 1)
         .unwrap();
     w.svm.expire_blockhash();

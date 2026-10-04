@@ -14,7 +14,8 @@ pub use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint
 
 pub use sasona::{at_price, burn_of, coins_out, Fee, NETWORK_SEED, BURN_BPS, 
     Guarantee, Pool, Slices, COIN_DECIMALS, COIN_SEED, FEES_SEED, GUARANTEE_SEED, OPENING_COINS_PER_USD,
-    POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED,
+    POOL_COIN_SEED, POOL_SEED, POOL_USD_SEED, USD_MINT, VAULT_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED,
+    Cover, Exit, JUDGE, MAX_SHARES_PER_COIN, NOTICE_SECONDS, coins_for_shares, shares_for,
 };
 
 pub const DOLLAR: u64 = 1_000_000;
@@ -92,7 +93,18 @@ pub fn put_token_account(svm: &mut LiteSVM, at: Address, mint: Address, owner: A
 }
 
 pub fn world() -> World {
-    let mut svm = LiteSVM::new();
+    world_with(true)
+}
+
+/// Signatures are not checked, so a test can act as the judge, whose key it
+/// does not hold. Only the claim tests use this: everywhere else a missing
+/// signature is part of what is being tested.
+pub fn world_unverified() -> World {
+    world_with(false)
+}
+
+pub fn world_with(sigverify: bool) -> World {
+    let mut svm = LiteSVM::new().with_sigverify(sigverify);
     let so = std::env::var("SASONA_SO").expect("run through scripts/build.sh, which sets SASONA_SO");
     svm.add_program_from_file(program_id(), so).unwrap();
 
@@ -120,7 +132,8 @@ pub fn open_ix(w: &World, usd_mint: Address, depositor_usd: Address, amount: u64
         fees: key(pda(&[FEES_SEED])),
         depositor_usd: key(depositor_usd),
         depositor_coin: key(ata(d, coin)),
-        guarantee_vault: key(pda(&[VAULT_SEED, d.as_ref()])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
         guarantee: key(pda(&[GUARANTEE_SEED, d.as_ref()])),
         token_program: anchor_spl::token::ID,
         associated_token_program: anchor_spl::associated_token::ID,
@@ -184,7 +197,9 @@ pub fn deposit_ix(who: Address, usd_mint: Address, from: Address, amount: u64) -
         fees: key(pda(&[FEES_SEED])),
         depositor_usd: key(from),
         depositor_coin: key(ata(who, coin)),
-        guarantee_vault: key(pda(&[VAULT_SEED, who.as_ref()])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        legacy_vault: key(pda(&[VAULT_SEED, who.as_ref()])),
         guarantee: key(pda(&[GUARANTEE_SEED, who.as_ref()])),
         token_program: anchor_spl::token::ID,
         associated_token_program: anchor_spl::associated_token::ID,
@@ -265,6 +280,10 @@ pub fn assert_books_balance(svm: &LiteSVM) {
     assert_eq!(token_balance(svm, pda(&[POOL_COIN_SEED])), p.coin_reserve, "pool coins");
     assert!(token_balance(svm, pda(&[POOL_USD_SEED])) >= p.usd_reserve, "pool dollars");
     assert!(token_balance(svm, pda(&[FEES_SEED])) >= p.fees_held, "fees");
+    if svm.get_account(&pda(&[COVER_SEED])).is_some() {
+        let c: Cover = read(svm, pda(&[COVER_SEED]));
+        assert!(token_balance(svm, pda(&[COVER_VAULT_SEED])) >= c.coins, "cover");
+    }
 }
 
 pub fn add_depth_ix(who: Address, usd_mint: Address, from: Address, amount: u64) -> Instruction {
@@ -285,4 +304,103 @@ pub fn add_depth_ix(who: Address, usd_mint: Address, from: Address, amount: u64)
 pub fn try_add_depth(svm: &mut LiteSVM, who: &Keypair, from: Address, amount: u64) -> Result<(), String> {
     svm.expire_blockhash();
     send(svm, add_depth_ix(who.pubkey(), usd(), from, amount), &[who])
+}
+
+/// Shares a person holds in the cover.
+pub fn shares_of(svm: &LiteSVM, who: Address) -> u64 {
+    let g: Guarantee = read(svm, pda(&[GUARANTEE_SEED, who.as_ref()]));
+    g.shares
+}
+
+pub fn cover(svm: &LiteSVM) -> Cover {
+    read(svm, pda(&[COVER_SEED]))
+}
+
+pub fn claim_ix(judge: Address, to: Address, dollars: u64) -> Instruction {
+    let accounts = sasona::accounts::Claim {
+        judge: key(judge),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        usd_mint: key(usd()),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        pool_coin: key(pda(&[POOL_COIN_SEED])),
+        fees: key(pda(&[FEES_SEED])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        claimant_usd: key(to),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::Claim { dollars, reference: [7u8; 32] }.data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+/// Send as the judge. Only works in `world_unverified`.
+pub fn claim_as_judge(svm: &mut LiteSVM, to: Address, dollars: u64) -> Result<(), String> {
+    let judge = addr(JUDGE);
+    if svm.get_account(&judge).map(|a| a.lamports).unwrap_or(0) == 0 {
+        svm.airdrop(&judge, 10_000_000_000).unwrap();
+    }
+    svm.expire_blockhash();
+    let msg = solana_message::Message::new_with_blockhash(&[claim_ix(judge, to, dollars)], Some(&judge), &svm.latest_blockhash());
+    let tx = Transaction::new_unsigned(msg);
+    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}\n{}", e.err, e.meta.logs.join("\n")))
+}
+
+pub fn request_ix(owner: Address, shares: u64) -> Instruction {
+    let accounts = sasona::accounts::RequestRelease {
+        owner: key(owner),
+        guarantee: key(pda(&[GUARANTEE_SEED, owner.as_ref()])),
+        exit: key(pda(&[EXIT_SEED, owner.as_ref()])),
+        legacy_vault: key(pda(&[VAULT_SEED, owner.as_ref()])),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::RequestRelease { shares }.data() }
+}
+
+pub fn release_ix(owner: Address) -> Instruction {
+    let coin = pda(&[COIN_SEED]);
+    let accounts = sasona::accounts::Release {
+        owner: key(owner),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(coin),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        exit: key(pda(&[EXIT_SEED, owner.as_ref()])),
+        owner_coin: key(ata(owner, coin)),
+        token_program: anchor_spl::token::ID,
+        associated_token_program: anchor_spl::associated_token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Release {}.data() }
+}
+
+pub fn join_ix(caller: Address, owner: Address) -> Instruction {
+    let accounts = sasona::accounts::JoinCover {
+        caller: key(caller),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        cover: key(pda(&[COVER_SEED])),
+        cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        owner: key(owner),
+        guarantee: key(pda(&[GUARANTEE_SEED, owner.as_ref()])),
+        legacy_vault: key(pda(&[VAULT_SEED, owner.as_ref()])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::JoinCover {}.data() }
+}
+
+pub fn try_ix(svm: &mut LiteSVM, ix: Instruction, who: &Keypair) -> Result<(), String> {
+    svm.expire_blockhash();
+    send(svm, ix, &[who])
+}
+
+pub fn days_pass(svm: &mut LiteSVM, days: i64) {
+    let mut c: solana_clock::Clock = svm.get_sysvar();
+    c.unix_timestamp += days * 24 * 60 * 60;
+    svm.set_sysvar(&c);
 }

@@ -26,7 +26,7 @@ fn opening_splits_the_deposit_and_mints_against_it() {
 
     let in_pool = token_balance(&w.svm, pda(&[POOL_COIN_SEED]));
     let free = token_balance(&w.svm, ata(d, coin));
-    let locked = token_balance(&w.svm, pda(&[VAULT_SEED, d.as_ref()]));
+    let locked = token_balance(&w.svm, pda(&[COVER_VAULT_SEED]));
     assert_eq!(in_pool, s.rest * PRICE);
     assert_eq!(free, s.free * PRICE);
     assert_eq!(locked, s.guarantee * PRICE);
@@ -53,7 +53,9 @@ fn the_records_match_the_balances() {
 
     let g: Guarantee = read(&w.svm, pda(&[GUARANTEE_SEED, d.as_ref()]));
     assert_eq!(addr(g.owner), d);
-    assert_eq!(g.coins, s.guarantee * PRICE);
+    assert_eq!(g.shares, s.guarantee * PRICE, "the first coins in buy shares one for one");
+    let c = cover(&w.svm);
+    assert_eq!((c.shares, c.coins), (g.shares, s.guarantee * PRICE));
 }
 
 #[test]
@@ -115,7 +117,7 @@ fn the_depositor_cannot_take_their_guarantee_back() {
     open(&mut w, 100 * DOLLAR);
     let d = w.depositor.insecure_clone();
     let coin = pda(&[COIN_SEED]);
-    let vault = pda(&[VAULT_SEED, d.pubkey().as_ref()]);
+    let vault = pda(&[COVER_VAULT_SEED]);
     let ix = spl_token_interface::instruction::transfer(&token_program(), &vault, &ata(d.pubkey(), coin), &d.pubkey(), &[], 1)
         .unwrap();
     let err = send(&mut w.svm, ix, &[&d]).unwrap_err();

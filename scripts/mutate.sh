@@ -20,7 +20,7 @@ SO="$WORK/target/deploy/sasona.so"
 
 # name | perl substitution applied to lib.rs
 MUTANTS=(
-  "guarantee vault held by the depositor|s/(VAULT_SEED, depositor\.key\(\)\.as_ref\(\)\], bump,\s+token::mint = coin_mint, token::authority = )pool/\${1}depositor/"
+  "cover vault held by the depositor|s/(COVER_VAULT_SEED\], bump,\s+token::mint = coin_mint, token::authority = )pool/\${1}depositor/"
   "outside forgets the guarantee|s/pool\.outside = add\(free_coins, guarantee_coins\)\?;/pool.outside = free_coins;/"
   "any token accepted as the dollar|s/#\[account\(address = USD_MINT @ SasonaError::NotTheDollar, mint::decimals = USD_DECIMALS\)\]/#[account(mint::decimals = USD_DECIMALS)]/"
   "dollar decimals unchecked|s/#\[account\(address = USD_MINT @ SasonaError::NotTheDollar, mint::decimals = USD_DECIMALS\)\]/#[account(address = USD_MINT @ SasonaError::NotTheDollar)]/"
@@ -32,10 +32,10 @@ MUTANTS=(
   "deposit: pool side rounded up|s/let into_pool = at_price\(s\.rest, coin_before, usd_before\)\?;/let into_pool = at_price(s.rest, coin_before, usd_before)? + 1;/"
   "deposit: pool side rounded up, price check removed|s/let into_pool = at_price\(s\.rest, coin_before, usd_before\)\?;/let into_pool = at_price(s.rest, coin_before, usd_before)? + 1;/; s/\s*pool\.price_held\(usd_before, coin_before\)\?;//"
   "deposit: dollars not recorded|s/pool\.usd_reserve = add\(usd_before, s\.rest\)\?;/pool.usd_reserve = usd_before;/"
-  "deposit: a second deposit replaces the guarantee|s/g\.coins = add\(g\.coins, guarantee_coins\)\?;/g.coins = guarantee_coins;/"
+  "deposit: a second deposit replaces the guarantee|s/g\.shares = add\(g\.shares, shares\)\?;/g.shares = shares;/"
   "deposit: any token accepted as the dollar|s/#\[account\(address = pool\.usd_mint @ SasonaError::NotTheDollar\)\]\s*//"
   "deposit: depositor's dollars not checked for owner|s/(pub struct Deposit.*?)token::mint = usd_mint, token::authority = depositor/\${1}token::mint = usd_mint/s"
-  "deposit: guarantee vault held by the depositor|s/(pub struct Deposit.*?VAULT_SEED, depositor\.key\(\)\.as_ref\(\)\], bump,\s+token::mint = coin_mint, token::authority = )pool/\${1}depositor/s"
+  "deposit: guarantee minted to the depositor|s/(pub fn deposit.*?a\.cpi_mint\(&a\.)cover_vault/\${1}depositor_coin/s"
   "deposit: fee kept in the pool's reserve|s/(pub fn deposit.*?a\.cpi_transfer\(&a\.depositor_usd, )&a\.fees/\${1}&a.pool_usd/s"
   "deposit: tiny deposits allowed|s/\s*require!\(s\.fee > 0 && free_coins > 0 && guarantee_coins > 0, SasonaError::TooSmall\);//"
   "deposit: deposits too small for a fee allowed|s/require!\(s\.fee > 0 && /require!(/"
@@ -62,6 +62,26 @@ MUTANTS=(
   "depth: any token accepted as the dollar|s/(pub struct AddDepth.*?)#\[account\(address = pool\.usd_mint @ SasonaError::NotTheDollar\)\]\s*/\${1}/s"
   "depth: giver's dollars not checked for owner|s/token::mint = usd_mint, token::authority = giver/token::mint = usd_mint/"
   "depth: pool's dollar account not pinned|s/(pub struct AddDepth.*?)#\[account\(mut, seeds = \[POOL_USD_SEED\], bump\)\]/\${1}#[account(mut)]/s"
+  "claim: anyone can approve|s/\s*require_keys_eq!\(ctx\.accounts\.judge\.key\(\), JUDGE, SasonaError::NotTheJudge\);//"
+  "claim: the pool's coins not burned|s/for from in \[a\.pool_coin\.to_account_info\(\), a\.cover_vault\.to_account_info\(\)\]/for from in [a.cover_vault.to_account_info()]/"
+  "claim: the cover not burned|s/for from in \[a\.pool_coin\.to_account_info\(\), a\.cover_vault\.to_account_info\(\)\]/for from in [a.pool_coin.to_account_info()]/"
+  "claim: the cover's record not reduced|s/\s*cover\.coins -= burn;//"
+  "claim: pool side rounded down|s/\(dollars as u128 \* coins as u128\)\.div_ceil\(usd as u128\)/dollars as u128 * coins as u128 \/ usd as u128/"
+  "claim: larger than the cover allowed|s/burn < coins && burn < cover\.coins/burn < coins/"
+  "claim: paid in any token|s/(pub struct Claim.*?#\[account\(mut, )token::mint = usd_mint,\s*/\${1}/s"
+  "claim: cover vault not pinned|s/(pub struct Claim.*?)#\[account\(mut, seeds = \[COVER_VAULT_SEED\], bump\)\]/\${1}#[account(mut)]/s"
+  "release request: shares not taken from the guarantee|s/g\.shares = g\.shares\.checked_sub\(shares\)\.ok_or\(SasonaError::MoreThanIsThere\)\?;/g.shares.checked_sub(shares).ok_or(SasonaError::MoreThanIsThere)?;/"
+  "release request: no notice|s/\.checked_add\(NOTICE_SECONDS\)/.checked_add(0)/"
+  "release: notice not checked|s/\s*require!\(Clock::get\(\)\?\.unix_timestamp >= ctx\.accounts\.exit\.ready_at, SasonaError::NoticeNotOver\);//"
+  "release: cover shares not reduced|s/\s*cover\.shares -= shares;//"
+  "deposit: an old guarantee mixed with shares|s/\s*require!\(ctx\.accounts\.legacy_vault\.data_is_empty\(\), SasonaError::JoinCoverFirst\);\n(\s*let s = Slices)/\n\${1}/"
+  "join: rent to anyone|s/#\[account\(mut, address = guarantee\.owner\)\]/#[account(mut)]/"
+  "join: record not converted to shares|s/\s*ctx\.accounts\.guarantee\.shares = shares;//"
+  "claim: the cover may get too thin|s/\s*require!\(\s*\(cover\.coins - burn\) as u128 \* MAX_SHARES_PER_COIN as u128 >= cover\.shares as u128,\s*SasonaError::CoverTooThin\s*\);//"
+  "claim: paid into the fee account|s/,\s*constraint = claimant_usd\.key\(\) != fees\.key\(\) @ SasonaError::NotTheClaimant//"
+  "release request: an old guarantee mixed with shares|s/(pub fn request_release.*?)require!\(ctx\.accounts\.legacy_vault\.data_is_empty\(\), SasonaError::JoinCoverFirst\);/\${1}/s"
+  "join: adds to the record instead of replacing it|s/ctx\.accounts\.guarantee\.shares = shares;/ctx.accounts.guarantee.shares += shares;/"
+  "cover: new shares rounded up|s/let v = coins as u128 \* cover_shares as u128 \/ cover_coins as u128;/let v = (coins as u128 * cover_shares as u128).div_ceil(cover_coins as u128);/"
   "fee: coin mint not pinned|s/(pub struct PayFee.*?)#\[account\(mut, address = pool\.coin_mint\)\]/\${1}#[account(mut)]/s"
   "settle: fee account not pinned|s/(pub struct SettleEntryFees.*?)#\[account\(mut, seeds = \[FEES_SEED\], bump\)\]/\${1}#[account(mut)]/s"
   "settle: network account not pinned|s/(pub struct SettleEntryFees.*?)#\[account\(init_if_needed, payer = caller, seeds = \[NETWORK_SEED\], bump,\s*token::mint = coin_mint, token::authority = pool\)\]/\${1}#[account(mut)]/s"
@@ -89,6 +109,9 @@ echo "baseline passes"
 missed=0
 for m in "${MUTANTS[@]}"; do
     name="${m%%|*}"; sub="${m#*|}"
+    # SASONA_ONLY=regex runs only the mutations whose names match, for a step
+    # that added code without touching what earlier steps already tested.
+    if [ -n "${SASONA_ONLY:-}" ] && ! [[ "$name" =~ $SASONA_ONLY ]]; then continue; fi
     reset
     before=$(sha256sum "$WORK/$LIB")
     perl -0pi -e "$sub" "$WORK/$LIB"

@@ -20,7 +20,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::pubkey;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Burn, CloseAccount, Mint, MintTo, Token, TokenAccount, Transfer};
 
 declare_id!("7eiHSnDkM4WjJdY36D2Yqsjw893mCMUtBAwMCQ5adL99");
 
@@ -84,6 +84,33 @@ const _: () = assert!(
 
 pub const NETWORK_SEED: &[u8] = b"network";
 
+/// Every depositor's guarantee is cover for every buyer, so the guarantees
+/// sit together in one vault and each depositor holds shares of it. A claim
+/// reduces the coins behind every share at once.
+pub const COVER_SEED: &[u8] = b"cover";
+pub const COVER_VAULT_SEED: &[u8] = b"cover-vault";
+pub const EXIT_SEED: &[u8] = b"exit";
+
+/// How long a guarantee stays exposed to claims after its owner asks for it
+/// back. It has to outlast the window in which a bad purchase can be
+/// reported and the time it takes to judge it. The design puts the floor at
+/// 31 days and says 45 leaves margin.
+///
+/// Not yet enough on its own: once the notice has run out, an owner can
+/// still release just ahead of a claim they can see coming. Releases will
+/// pause while a claim is pending, once claims are filed on chain (part 7).
+pub const NOTICE_SECONDS: i64 = 45 * 24 * 60 * 60;
+
+/// A claim may not leave the cover thinner than one coin unit behind every
+/// thousand shares. Below that, new deposits would buy so many shares that
+/// the count overflows and nobody could deposit again.
+pub const MAX_SHARES_PER_COIN: u64 = 1_000;
+
+/// NOTE, temporary: who may approve a claim. Deciding claims belongs to
+/// members drawn at random, which is part 7 of the roadmap. Until then it is
+/// the key that can already upgrade this program, so nothing new is trusted.
+pub const JUDGE: Pubkey = pubkey!("CCsLKV9yCucqYmdb1KarjsTD5pA6q2fzucBa9ozCTSFu");
+
 #[program]
 pub mod sasona {
     use super::*;
@@ -121,7 +148,7 @@ pub mod sasona {
         token::transfer(a.cpi_transfer(&a.depositor_usd, &a.fees, a.depositor.to_account_info()), s.fee)?;
         token::mint_to(a.cpi_mint(&a.pool_coin).with_signer(signer), into_pool)?;
         token::mint_to(a.cpi_mint(&a.depositor_coin).with_signer(signer), free_coins)?;
-        token::mint_to(a.cpi_mint(&a.guarantee_vault).with_signer(signer), guarantee_coins)?;
+        token::mint_to(a.cpi_mint(&a.cover_vault).with_signer(signer), guarantee_coins)?;
 
         let pool = &mut ctx.accounts.pool;
         pool.usd_reserve = s.rest;
@@ -129,16 +156,22 @@ pub mod sasona {
         pool.outside = add(free_coins, guarantee_coins)?;
         pool.fees_held = s.fee;
 
+        let cover = &mut ctx.accounts.cover;
+        cover.bump = ctx.bumps.cover;
+        let shares = cover.take_in(guarantee_coins)?;
+
         let g = &mut ctx.accounts.guarantee;
         g.owner = ctx.accounts.depositor.key();
-        g.coins = guarantee_coins;
+        g.shares = shares;
         g.bump = ctx.bumps.guarantee;
 
         ctx.accounts.coin_mint.reload()?;
         ctx.accounts.pool_usd.reload()?;
         ctx.accounts.fees.reload()?;
+        ctx.accounts.cover_vault.reload()?;
         let a = &ctx.accounts;
         a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        a.cover.check(a.cover_vault.amount)?;
 
         emit!(Opened {
             usd_mint,
@@ -159,6 +192,7 @@ pub mod sasona {
     /// the price can only drift up, by less than one unit.
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, SasonaError::NothingDeposited);
+        require!(ctx.accounts.legacy_vault.data_is_empty(), SasonaError::JoinCoverFirst);
         let s = Slices::of(amount)?;
 
         let (usd_before, coin_before) = (ctx.accounts.pool.usd_reserve, ctx.accounts.pool.coin_reserve);
@@ -176,7 +210,7 @@ pub mod sasona {
         token::transfer(a.cpi_transfer(&a.depositor_usd, &a.fees, a.depositor.to_account_info()), s.fee)?;
         token::mint_to(a.cpi_mint(&a.pool_coin).with_signer(signer), into_pool)?;
         token::mint_to(a.cpi_mint(&a.depositor_coin).with_signer(signer), free_coins)?;
-        token::mint_to(a.cpi_mint(&a.guarantee_vault).with_signer(signer), guarantee_coins)?;
+        token::mint_to(a.cpi_mint(&a.cover_vault).with_signer(signer), guarantee_coins)?;
 
         let pool = &mut ctx.accounts.pool;
         pool.usd_reserve = add(usd_before, s.rest)?;
@@ -185,19 +219,23 @@ pub mod sasona {
         pool.fees_held = add(pool.fees_held, s.fee)?;
         pool.price_held(usd_before, coin_before)?;
 
+        let shares = ctx.accounts.cover.take_in(guarantee_coins)?;
+
         // A first deposit creates the guarantee; a later one adds to it.
         let g = &mut ctx.accounts.guarantee;
         if g.owner == Pubkey::default() {
             g.owner = ctx.accounts.depositor.key();
             g.bump = ctx.bumps.guarantee;
         }
-        g.coins = add(g.coins, guarantee_coins)?;
+        g.shares = add(g.shares, shares)?;
 
         ctx.accounts.coin_mint.reload()?;
         ctx.accounts.pool_usd.reload()?;
         ctx.accounts.fees.reload()?;
+        ctx.accounts.cover_vault.reload()?;
         let a = &ctx.accounts;
         a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        a.cover.check(a.cover_vault.amount)?;
 
         emit!(Deposited {
             depositor: a.depositor.key(),
@@ -336,6 +374,196 @@ pub mod sasona {
         emit!(DepthAdded { giver: a.giver.key(), amount });
         Ok(())
     }
+
+    /// Move a guarantee made before the cover existed into the cover.
+    ///
+    /// A one-off for the guarantees already on devnet. The coins move from
+    /// the depositor's old vault, which is then closed with its rent going
+    /// back to them, and the record is converted from coins to shares.
+    /// Anyone may call it, because it changes nothing anybody owns.
+    pub fn join_cover(ctx: Context<JoinCover>) -> Result<()> {
+        // Everything in the old vault moves, including anything someone else
+        // sent to it: requiring an exact match would let one stray coin unit
+        // block the move for ever.
+        let coins = ctx.accounts.legacy_vault.amount;
+        require!(coins > 0, SasonaError::NothingDeposited);
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer {
+                    from: a.legacy_vault.to_account_info(),
+                    to: a.cover_vault.to_account_info(),
+                    authority: a.pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+            coins,
+        )?;
+        token::close_account(
+            CpiContext::new(
+                a.token_program.key(),
+                CloseAccount {
+                    account: a.legacy_vault.to_account_info(),
+                    destination: a.owner.to_account_info(),
+                    authority: a.pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+        )?;
+
+        let cover = &mut ctx.accounts.cover;
+        cover.bump = ctx.bumps.cover;
+        let shares = cover.take_in(coins)?;
+        ctx.accounts.guarantee.shares = shares;
+
+        ctx.accounts.cover_vault.reload()?;
+        let a = &ctx.accounts;
+        a.cover.check(a.cover_vault.amount)?;
+        emit!(JoinedCover { owner: a.owner.key(), coins, shares });
+        Ok(())
+    }
+
+    /// Pay a buyer back out of the cover.
+    ///
+    /// The dollars leave the pool, and two equal amounts of coin are burned:
+    /// the pool's side, so the price does not fall, and the cover's, because
+    /// the guarantees are what paid. It undoes, for this many dollars, what a
+    /// deposit's guarantee slice did. `reference` names the purchase.
+    pub fn claim(ctx: Context<Claim>, dollars: u64, reference: [u8; 32]) -> Result<()> {
+        require_keys_eq!(ctx.accounts.judge.key(), JUDGE, SasonaError::NotTheJudge);
+        require!(dollars > 0, SasonaError::NothingDeposited);
+
+        let (usd, coins) = (ctx.accounts.pool.usd_reserve, ctx.accounts.pool.coin_reserve);
+        require!(dollars < usd, SasonaError::MoreThanIsThere);
+        // Rounded up, so the pool gives up at least the coins behind the
+        // dollars and the price can only rise.
+        let burn = u64::try_from((dollars as u128 * coins as u128).div_ceil(usd as u128))
+            .map_err(|_| SasonaError::Overflow)?;
+        // The cover never empties, and never gets so thin that new shares
+        // would overflow; see MAX_SHARES_PER_COIN.
+        let cover = &ctx.accounts.cover;
+        require!(burn < coins && burn < cover.coins, SasonaError::MoreThanIsThere);
+        require!(
+            (cover.coins - burn) as u128 * MAX_SHARES_PER_COIN as u128 >= cover.shares as u128,
+            SasonaError::CoverTooThin
+        );
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer {
+                    from: a.pool_usd.to_account_info(),
+                    to: a.claimant_usd.to_account_info(),
+                    authority: a.pool.to_account_info(),
+                },
+            )
+            .with_signer(signer),
+            dollars,
+        )?;
+        for from in [a.pool_coin.to_account_info(), a.cover_vault.to_account_info()] {
+            token::burn(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Burn { mint: a.coin_mint.to_account_info(), from, authority: a.pool.to_account_info() },
+                )
+                .with_signer(signer),
+                burn,
+            )?;
+        }
+
+        let pool = &mut ctx.accounts.pool;
+        pool.usd_reserve = usd - dollars;
+        pool.coin_reserve = coins - burn;
+        pool.outside = pool.outside.checked_sub(burn).ok_or(SasonaError::Overflow)?;
+        require!(
+            pool.usd_reserve as u128 * coins as u128 >= usd as u128 * pool.coin_reserve as u128,
+            SasonaError::PriceMoved
+        );
+        let cover = &mut ctx.accounts.cover;
+        cover.coins -= burn;
+
+        ctx.accounts.coin_mint.reload()?;
+        ctx.accounts.pool_usd.reload()?;
+        ctx.accounts.cover_vault.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        a.cover.check(a.cover_vault.amount)?;
+
+        emit!(Claimed { claimant: a.claimant_usd.owner, dollars, coins_burned: burn.saturating_mul(2), reference });
+        Ok(())
+    }
+
+    /// Ask for some of your guarantee back.
+    ///
+    /// The shares leave your guarantee but stay in the cover, paying claims
+    /// like any other, until the notice runs out. Asking again adds to what
+    /// is waiting and starts the notice again.
+    pub fn request_release(ctx: Context<RequestRelease>, shares: u64) -> Result<()> {
+        require!(shares > 0, SasonaError::NothingDeposited);
+        require!(ctx.accounts.legacy_vault.data_is_empty(), SasonaError::JoinCoverFirst);
+        let g = &mut ctx.accounts.guarantee;
+        g.shares = g.shares.checked_sub(shares).ok_or(SasonaError::MoreThanIsThere)?;
+
+        let exit = &mut ctx.accounts.exit;
+        exit.owner = ctx.accounts.owner.key();
+        exit.bump = ctx.bumps.exit;
+        exit.shares = add(exit.shares, shares)?;
+        exit.ready_at = Clock::get()?
+            .unix_timestamp
+            .checked_add(NOTICE_SECONDS)
+            .ok_or(SasonaError::Overflow)?;
+
+        emit!(ReleaseRequested { owner: exit.owner, shares: exit.shares, ready_at: exit.ready_at });
+        Ok(())
+    }
+
+    /// Take back a guarantee whose notice has run out, as coins you hold.
+    ///
+    /// What comes back is the shares' part of the cover now, which is less
+    /// than went in if claims were paid in the meantime.
+    pub fn release(ctx: Context<Release>) -> Result<()> {
+        require!(Clock::get()?.unix_timestamp >= ctx.accounts.exit.ready_at, SasonaError::NoticeNotOver);
+        let shares = ctx.accounts.exit.shares;
+        let coins = coins_for_shares(shares, ctx.accounts.cover.shares, ctx.accounts.cover.coins)?;
+
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        if coins > 0 {
+            token::transfer(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Transfer {
+                        from: a.cover_vault.to_account_info(),
+                        to: a.owner_coin.to_account_info(),
+                        authority: a.pool.to_account_info(),
+                    },
+                )
+                .with_signer(signer),
+                coins,
+            )?;
+        }
+        // The last shares out are all the shares, and take every coin left.
+        let cover = &mut ctx.accounts.cover;
+        cover.shares -= shares;
+        cover.coins -= coins;
+
+        ctx.accounts.cover_vault.reload()?;
+        let a = &ctx.accounts;
+        a.cover.check(a.cover_vault.amount)?;
+        emit!(Released { owner: a.owner.key(), shares, coins });
+        Ok(())
+    }
 }
 
 /// Buy coin from the pool with `dollars` that have already arrived in its
@@ -447,10 +675,13 @@ pub struct Open<'info> {
               associated_token::mint = coin_mint, associated_token::authority = depositor)]
     pub depositor_coin: Account<'info, TokenAccount>,
 
-    /// Held by the pool, not the depositor, so the depositor cannot move it.
-    #[account(init, payer = depositor, seeds = [VAULT_SEED, depositor.key().as_ref()], bump,
+    #[account(init, payer = depositor, space = 8 + Cover::INIT_SPACE, seeds = [COVER_SEED], bump)]
+    pub cover: Account<'info, Cover>,
+
+    /// Held by the pool, not by any depositor, so no depositor can move it.
+    #[account(init, payer = depositor, seeds = [COVER_VAULT_SEED], bump,
               token::mint = coin_mint, token::authority = pool)]
-    pub guarantee_vault: Account<'info, TokenAccount>,
+    pub cover_vault: Account<'info, TokenAccount>,
 
     #[account(init, payer = depositor, space = 8 + Guarantee::INIT_SPACE,
               seeds = [GUARANTEE_SEED, depositor.key().as_ref()], bump)]
@@ -512,15 +743,23 @@ pub struct Deposit<'info> {
     #[account(mut, token::mint = usd_mint, token::authority = depositor)]
     pub depositor_usd: Account<'info, TokenAccount>,
 
-    /// These three already exist if this depositor has deposited before, and
+    /// These two already exist if this depositor has deposited before, and
     /// then the constraints are checked against what is there.
     #[account(init_if_needed, payer = depositor,
               associated_token::mint = coin_mint, associated_token::authority = depositor)]
     pub depositor_coin: Account<'info, TokenAccount>,
 
-    #[account(init_if_needed, payer = depositor, seeds = [VAULT_SEED, depositor.key().as_ref()], bump,
-              token::mint = coin_mint, token::authority = pool)]
-    pub guarantee_vault: Account<'info, TokenAccount>,
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: where this depositor's guarantee lived before the cover
+    /// existed. Must be empty: a guarantee still there has to join the cover
+    /// first, or its old count would be mixed with shares.
+    #[account(seeds = [VAULT_SEED, depositor.key().as_ref()], bump)]
+    pub legacy_vault: UncheckedAccount<'info>,
 
     #[account(init_if_needed, payer = depositor, space = 8 + Guarantee::INIT_SPACE,
               seeds = [GUARANTEE_SEED, depositor.key().as_ref()], bump)]
@@ -648,6 +887,128 @@ pub struct AddDepth<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct JoinCover<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(init_if_needed, payer = caller, space = 8 + Cover::INIT_SPACE, seeds = [COVER_SEED], bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(init_if_needed, payer = caller, seeds = [COVER_VAULT_SEED], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: the guarantee's owner, named by the guarantee record; receives
+    /// the old vault's rent.
+    #[account(mut, address = guarantee.owner)]
+    pub owner: UncheckedAccount<'info>,
+
+    #[account(mut, seeds = [GUARANTEE_SEED, guarantee.owner.as_ref()], bump = guarantee.bump)]
+    pub guarantee: Account<'info, Guarantee>,
+
+    #[account(mut, seeds = [VAULT_SEED, guarantee.owner.as_ref()], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub legacy_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Claim<'info> {
+    pub judge: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(address = pool.usd_mint @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    /// The buyer being paid back, in the pool's dollar. Never one of the
+    /// pool's own accounts, where the dollars would sit unrecorded.
+    #[account(mut, token::mint = usd_mint,
+              constraint = claimant_usd.key() != pool_usd.key() @ SasonaError::NotTheClaimant,
+              constraint = claimant_usd.key() != fees.key() @ SasonaError::NotTheClaimant)]
+    pub claimant_usd: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RequestRelease<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(mut, seeds = [GUARANTEE_SEED, owner.key().as_ref()], bump = guarantee.bump,
+              has_one = owner)]
+    pub guarantee: Account<'info, Guarantee>,
+
+    #[account(init_if_needed, payer = owner, space = 8 + Exit::INIT_SPACE,
+              seeds = [EXIT_SEED, owner.key().as_ref()], bump)]
+    pub exit: Account<'info, Exit>,
+
+    /// CHECK: must be empty; see `Deposit::legacy_vault`.
+    #[account(seeds = [VAULT_SEED, owner.key().as_ref()], bump)]
+    pub legacy_vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Release<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [COVER_SEED], bump = cover.bump)]
+    pub cover: Account<'info, Cover>,
+
+    #[account(mut, seeds = [COVER_VAULT_SEED], bump)]
+    pub cover_vault: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [EXIT_SEED, owner.key().as_ref()], bump = exit.bump,
+              has_one = owner, close = owner)]
+    pub exit: Account<'info, Exit>,
+
+    #[account(init_if_needed, payer = owner,
+              associated_token::mint = coin_mint, associated_token::authority = owner)]
+    pub owner_coin: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
 // --------------------------------------------------------------------- state
 
 #[account]
@@ -690,7 +1051,50 @@ impl Pool {
 #[derive(InitSpace)]
 pub struct Guarantee {
     pub owner: Pubkey,
+    /// Shares of the cover. Before the cover existed this field counted
+    /// coins in the depositor's own vault; `join_cover` converts it.
+    pub shares: u64,
+    pub bump: u8,
+}
+
+/// The guarantees, together. Every share is a claim on the same coins.
+#[account]
+#[derive(InitSpace)]
+pub struct Cover {
+    pub bump: u8,
+    pub shares: u64,
+    /// Coins in the cover vault, as recorded. Coins sent to the vault by
+    /// anyone else are ignored, so nobody can change what a share is worth by
+    /// giving.
     pub coins: u64,
+}
+
+impl Cover {
+    /// Add guarantee coins that have just arrived in the vault, and return
+    /// the shares they buy, rounded down so existing shares never lose.
+    pub fn take_in(&mut self, coins: u64) -> Result<u64> {
+        let shares = shares_for(coins, self.shares, self.coins)?;
+        require!(shares > 0, SasonaError::TooSmall);
+        self.shares = add(self.shares, shares)?;
+        self.coins = add(self.coins, coins)?;
+        Ok(shares)
+    }
+
+    pub fn check(&self, vault: u64) -> Result<()> {
+        require!(vault >= self.coins, SasonaError::SupplyMismatch);
+        require!((self.shares == 0) == (self.coins == 0), SasonaError::SupplyMismatch);
+        Ok(())
+    }
+}
+
+/// A guarantee its owner has asked for back. Still in the cover, and still
+/// paying claims, until the notice runs out.
+#[account]
+#[derive(InitSpace)]
+pub struct Exit {
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub ready_at: i64,
     pub bump: u8,
 }
 
@@ -719,6 +1123,35 @@ pub struct FeePaid {
     pub reserve: u64,
     pub burned: u64,
     pub shared: u64,
+}
+
+#[event]
+pub struct JoinedCover {
+    pub owner: Pubkey,
+    pub coins: u64,
+    pub shares: u64,
+}
+
+#[event]
+pub struct Claimed {
+    pub claimant: Pubkey,
+    pub dollars: u64,
+    pub coins_burned: u64,
+    pub reference: [u8; 32],
+}
+
+#[event]
+pub struct ReleaseRequested {
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub ready_at: i64,
+}
+
+#[event]
+pub struct Released {
+    pub owner: Pubkey,
+    pub shares: u64,
+    pub coins: u64,
 }
 
 #[event]
@@ -761,6 +1194,24 @@ impl Fee {
     pub fn buy(&self) -> u64 {
         self.burn + self.participants
     }
+}
+
+/// Shares bought by `coins` added to a cover holding `cover_coins` behind
+/// `cover_shares`, rounded down. The first coins in buy shares one for one.
+pub fn shares_for(coins: u64, cover_shares: u64, cover_coins: u64) -> Result<u64> {
+    if cover_shares == 0 {
+        return Ok(coins);
+    }
+    require!(cover_coins > 0, SasonaError::PoolEmpty);
+    let v = coins as u128 * cover_shares as u128 / cover_coins as u128;
+    u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
+}
+
+/// Coins behind `shares` of a cover, rounded down.
+pub fn coins_for_shares(shares: u64, cover_shares: u64, cover_coins: u64) -> Result<u64> {
+    require!(cover_shares > 0 && shares <= cover_shares, SasonaError::MoreThanIsThere);
+    let v = shares as u128 * cover_coins as u128 / cover_shares as u128;
+    u64::try_from(v).map_err(|_| SasonaError::Overflow.into())
 }
 
 /// The burn's share of an amount, rounded up so that it is never less than
@@ -840,6 +1291,18 @@ pub enum SasonaError {
     PriceMoved,
     #[msg("The pool holds no dollars to price against")]
     PoolEmpty,
+    #[msg("This guarantee is still in its old vault; it has to join the cover first")]
+    JoinCoverFirst,
+    #[msg("Only the judge can approve a claim, for now")]
+    NotTheJudge,
+    #[msg("More than there is")]
+    MoreThanIsThere,
+    #[msg("The notice has not run out yet")]
+    NoticeNotOver,
+    #[msg("That claim would leave the cover too thin for new deposits")]
+    CoverTooThin,
+    #[msg("A claim cannot be paid into the pool's own accounts")]
+    NotTheClaimant,
     #[msg("Arithmetic overflow")]
     Overflow,
 }
