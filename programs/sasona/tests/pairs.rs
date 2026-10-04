@@ -106,20 +106,35 @@ fn a_second_reading_cannot_be_taken_in_the_first_ones_round() {
 }
 
 #[test]
-fn a_second_reading_cannot_start_in_the_slot_the_first_was_revealed() {
-    let mut w = world();
-    let d = w.depositor.insecure_clone();
-    let (other, _) = newcomer(&mut w.svm, 0);
-    let round = drawn_round(&mut w, &d, 1, 1_000);
-    let reread = drawn_round(&mut w, &other, 2, 1_100);
-    try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, SERVICE, sha256(&canonical_question(&nonce(1)))), &d).unwrap();
-    let first = reading_address(round, SERVICE);
-    w.svm.warp_to_slot(1_200);
-    try_ix(&mut w.svm, reveal_reading_ix(d.pubkey(), first, nonce(1), [1u8; 32], 1), &d).unwrap();
-    let err = try_ix(&mut w.svm, commit_second_ix(other.pubkey(), reread, SERVICE, [0u8; 32], first), &other).unwrap_err();
-    assert!(err.contains("TooEarly"), "{err}");
-    w.svm.warp_to_slot(1_201);
-    try_ix(&mut w.svm, commit_second_ix(other.pubkey(), reread, SERVICE, [0u8; 32], first), &other).unwrap();
+fn the_re_read_round_must_come_after_the_first_was_revealed() {
+    // SPEC.md 3.2: the first is the latest reading revealed before the
+    // re-read round was committed, so a round committed earlier cannot name it.
+    for (round_slot, ok) in [(1_100u64, false), (1_200, false), (1_201, true)] {
+        let mut w = world();
+        let d = w.depositor.insecure_clone();
+        let (other, _) = newcomer(&mut w.svm, 0);
+        let round = drawn_round(&mut w, &d, 1, 1_000);
+        try_ix(&mut w.svm, commit_reading_ix(d.pubkey(), round, SERVICE, sha256(&canonical_question(&nonce(1)))), &d).unwrap();
+        let first = reading_address(round, SERVICE);
+        if round_slot < 1_200 {
+            let reread = drawn_round(&mut w, &other, 2, round_slot);
+            w.svm.warp_to_slot(1_200);
+            try_ix(&mut w.svm, reveal_reading_ix(d.pubkey(), first, nonce(1), [1u8; 32], 1), &d).unwrap();
+            w.svm.warp_to_slot(1_300);
+            let err = try_ix(&mut w.svm, commit_second_ix(other.pubkey(), reread, SERVICE, [0u8; 32], first), &other).unwrap_err();
+            assert!(err.contains("TooEarly"), "{err}");
+            continue;
+        }
+        w.svm.warp_to_slot(1_200);
+        try_ix(&mut w.svm, reveal_reading_ix(d.pubkey(), first, nonce(1), [1u8; 32], 1), &d).unwrap();
+        let reread = drawn_round(&mut w, &other, 2, round_slot);
+        let res = try_ix(&mut w.svm, commit_second_ix(other.pubkey(), reread, SERVICE, [0u8; 32], first), &other);
+        if ok {
+            res.unwrap();
+        } else {
+            assert!(res.unwrap_err().contains("TooEarly"), "round committed at {round_slot}");
+        }
+    }
 }
 
 #[test]
@@ -153,4 +168,47 @@ fn a_pair_settles_against_its_own_first_reading_only() {
     // Passing the second reading as its own first would make it agree with itself.
     let err = try_ix(&mut w.svm, settle_pair_ix(s, s), &anyone).unwrap_err();
     assert!(err.contains("ConstraintHasOne"), "{err}");
+}
+
+#[test]
+fn a_pair_settles_only_against_the_first_it_named() {
+    // Another real, revealed reading of the same service, wrong_answer, would
+    // turn this false_or_decayed into agreed_fails if it could be swapped in.
+    let (mut w, first, other, reread) = first_and_rereader(1);
+    let s = second(&mut w, &other, reread, first, 2);
+    let (third, _) = newcomer(&mut w.svm, 0);
+    let later = drawn_round(&mut w, &third, 3, 1_300);
+    try_ix(&mut w.svm, commit_second_ix(third.pubkey(), later, SERVICE, sha256(&canonical_question(&nonce(3))), first), &third).unwrap();
+    let decoy = reading_address(later, SERVICE);
+    w.svm.warp_to_slot(1_400);
+    try_ix(&mut w.svm, reveal_reading_ix(third.pubkey(), decoy, nonce(3), [3u8; 32], 2), &third).unwrap();
+    let (anyone, _) = newcomer(&mut w.svm, 0);
+    let err = try_ix(&mut w.svm, settle_pair_ix(decoy, s), &anyone).unwrap_err();
+    assert!(err.contains("ConstraintHasOne"), "{err}");
+    try_ix(&mut w.svm, settle_pair_ix(first, s), &anyone).unwrap();
+    let p: Pair = read(&w.svm, pda(&[sasona::PAIR_SEED, s.as_ref()]));
+    assert_eq!(p.outcome, PAIR_FALSE_OR_DECAYED);
+}
+
+#[test]
+fn a_lapsed_second_reading_settles_nothing() {
+    let (mut w, first, other, reread) = first_and_rereader(1);
+    try_ix(&mut w.svm, commit_second_ix(other.pubkey(), reread, SERVICE, sha256(&canonical_question(&nonce(2))), first), &other).unwrap();
+    let s = reading_address(reread, SERVICE);
+    let committed = w.svm.get_sysvar::<solana_clock::Clock>().slot;
+    w.svm.warp_to_slot(committed + sasona::REVEAL_WINDOW_SLOTS + 1);
+    let (anyone, _) = newcomer(&mut w.svm, 0);
+    try_ix(&mut w.svm, lapsed_ix(s), &anyone).unwrap();
+    let err = try_ix(&mut w.svm, settle_pair_ix(first, s), &anyone).unwrap_err();
+    assert!(err.contains("ReadingNotOpen"), "{err}");
+}
+
+#[test]
+fn a_second_reading_needs_a_drawn_round() {
+    let (mut w, first, other, _) = first_and_rereader(1);
+    w.svm.warp_to_slot(1_300);
+    try_ix(&mut w.svm, open_round_ix(other.pubkey(), [9u8; 32], 10, 2, sha256(&[9u8; 32])), &other).unwrap();
+    let err = try_ix(&mut w.svm, commit_second_ix(other.pubkey(), round_address([9u8; 32]), SERVICE, [0u8; 32], first), &other)
+        .unwrap_err();
+    assert!(err.contains("RoundNotDrawn"), "{err}");
 }

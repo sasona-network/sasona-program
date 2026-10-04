@@ -580,8 +580,10 @@ pub mod sasona {
         // here as it does in the specification.
         require!(first.round != ctx.accounts.round.key(), SasonaError::SameRound);
         require!(first.reader != ctx.accounts.reader.key(), SasonaError::SameReader);
-        let now = Clock::get()?.slot;
-        require!(first.reveal_slot < now, SasonaError::TooEarly);
+        // The first is the latest reading of the service revealed before the
+        // re-read round was committed (SPEC.md 3.2). That it came before is
+        // checked here; that it is the latest is checked off chain (3.5).
+        require!(first.reveal_slot < ctx.accounts.round.commit_slot, SasonaError::TooEarly);
         let first_key = first.key();
 
         let a = &mut *ctx.accounts;
