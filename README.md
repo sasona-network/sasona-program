@@ -21,15 +21,23 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 |---|---|
 | `open` | Creates the coin and the pool, and makes the first deposit. The dollar and the opening price are fixed in the program, so whoever opens it gains nothing by going first. |
 | `deposit` | Deposits into the open pool at the pool's own price. The pool mints its side to match, so the price does not move. A repeat deposit adds to the same guarantee. |
+| `pay_fee` | Pays the markup on a purchase, in dollars. Five of its fifteen points stay in the pool as depth, 3% of it buys coin that is burned, and the rest buys coin for the participants. |
+| `settle_entry_fees` | Turns the entry fees deposits left waiting into coin the same way, without the reserve. Anyone can call it. |
+| `add_depth` | Adds dollars to the pool with nothing minted against them, which raises the price. Anyone can call it. |
 
 A deposit is split four ways:
 
 | Part | Share | Where it goes |
 |---|---|---|
-| Entry fee | 15% of the deposit | Held for the fee split, which comes in a later step |
+| Entry fee | 15% of the deposit | Held until settled into coin: 3% burned, the rest to the participants |
 | Spread | 15% of the rest | Stays in the pool as depth |
 | Guarantee | 75% of the rest | Locked in a vault the depositor cannot move |
 | Free | 10% of the rest | The depositor's own coins |
+
+## Temporary, and will change
+
+- None of the participant roles exists on chain yet, so their share of every fee goes to the network, and the network's coin waits in a vault held by the pool with no way out. Both change when developers, members, submitters and marketers come on chain.
+- Any caller can pay any fee, because there is no purchase on chain to tie it to yet. It has to be tied to real purchases before participants are paid.
 
 ## Build and test
 
