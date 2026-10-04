@@ -24,7 +24,6 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `pay_fee` | Pays the markup on a purchase, in dollars. Five of its fifteen points stay in the pool as depth, 3% of it buys coin that is burned, and the rest buys coin for the participants. |
 | `settle_entry_fees` | Turns the entry fees deposits left waiting into coin the same way, without the reserve. Anyone can call it. |
 | `add_depth` | Adds dollars to the pool with nothing minted against them, which raises the price. Anyone can call it. |
-| `claim` | Pays a buyer back in dollars out of the cover. Equal coins are burned from the pool, so the price does not fall, and from the cover, so every guarantee carries the loss alike. |
 | `request_release` | Asks for some of your guarantee back. It stays in the cover, still paying claims, for 45 days. |
 | `release` | After the notice, pays your shares' part of the cover to you as coins. |
 | `join_cover` | A one-off: moves a guarantee made before the cover existed into it. |
@@ -32,7 +31,7 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `reveal_round` | Reveals the seed and mixes it with the hash of a Solana slot that did not exist at commit time. The bond goes back. The rule that turns the result into picks is in [sasona-protocol](https://github.com/sasona-network/sasona-protocol). |
 | `mark_withheld` | Marks a round whose seed was not revealed in time. It can never be drawn, and the bond is lost. |
 | `commit_reading` | Before a drawn service is called, records the hash of the question for it. |
-| `reveal_reading` | After the call, reveals the nonce, the reply's hash and the verdict. The program builds the question from the nonce and refuses unless it is the one committed. A nonce belongs to the reading that committed to it first. |
+| `reveal_reading` | After the call, reveals the nonce, the reply's hash, the verdict and the address the service asked to be paid at. The program builds the question from the nonce and refuses unless it is the one committed. A nonce belongs to the reading that committed to it first. |
 | `mark_lapsed` | Marks a reading not revealed within about an hour. |
 | `commit_second_reading` | A reading in a re-read round that names the earlier reading it tests again: the same service, someone else's reading, revealed before the round was committed. |
 | `settle_pair` | Once the second reading is revealed, records what the two settle: works now, false or decayed, or agreed fails. Anyone can call it. |
@@ -42,8 +41,16 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `challenge` | Challenges a reading within 30 days of its reveal, for a 0.1 SOL bond. |
 | `open_evidence`, `write_evidence` | The reader puts a reading's reply on chain, in pieces. |
 | `answer_challenge` | Holds if the reply on chain hashes to what was recorded and gives the recorded verdict for the nonce. The bond goes to the member and the reply is sealed. |
-| `uphold_challenge` | After 7 days with no answer that held: the reading stops counting and the membership loses its stake, a tenth to the challenger and the rest held. |
+| `uphold_challenge` | After 7 days with no answer that held: the reading stops counting and the membership loses its stake. What it owes the cover comes out first, a tenth of the rest goes to the challenger, and the rest to the cover. |
 | `set_quote` | The member who took a reading sets, changes or withdraws what they would charge to insure a purchase from the service, in basis points. Only on a reading that says delivered, within 30 days, while the member is active. |
+| `buy` | A purchase covered by a quote. The price goes to the address the reading recorded, the premium to the member who quoted. Refused past the member's room to insure, or if the quote was raised past the rate the buyer accepts. |
+| `close_purchase` | After 7 days with no chargeback, gives the member back the room the purchase took. Anyone can call it. |
+| `charge_back` | Within 7 days, the buyer asks for the price back, with a 5% deposit unless nobody charged back the service in the last 30 days. Draws a member to replay the service. |
+| `record_draw` | Records the entropy of a replay's draw, which fixes the member drawn. |
+| `commit_replay` | The drawn member commits a reading of the service, as for a round. It is revealed with `reveal_reading`. |
+| `pass_draw` | After the hour to read, counts a draw nobody used, and draws again. After 8 the chargeback can be settled. |
+| `settle_chargeback` | Pays out what the replay decided: the buyer back out of the cover, or the deposit to the replayer. 7 days with no replay pays the buyer. |
+| `repay_cover` | Once the covering reading can no longer be challenged, takes what the member owes the cover out of their stake. A membership left with less than a whole stake leaves its seat. |
 
 A deposit is split four ways:
 
@@ -59,10 +66,8 @@ A deposit is split four ways:
 - None of the participant roles exists on chain yet, so their share of every fee goes to the network, and the network's coin waits in a vault held by the pool with no way out. Both change when developers, members, submitters and marketers come on chain.
 - Any caller can pay any fee, because there is no purchase on chain to tie it to yet. It has to be tied to real purchases before participants are paid.
 - Each reading is taken by the member drawn for it, but the round's opener still writes the list and picks when to open it.
-- The stake, the challenge bond and the challenger's tenth are devnet figures. A stake that deters has to grow with the traffic a service carries, which needs purchases on chain.
-- Taken stakes are held with no way out until chargebacks are on chain (part 7), which decides where they go.
-- Claims are approved by the key that can already upgrade the program. Members drawn at random replace it in part 7 of the roadmap.
-- Once its notice has run out, a guarantee can be released just ahead of a claim its owner can see coming. Releases will pause while a claim is pending, once claims are filed on chain (part 7).
+- The stake, the challenge bond, the challenger's tenth, the minimum covered price and the 5% are devnet figures. A stake that deters has to grow with the traffic a service carries, now that purchases are on chain.
+- Once its notice has run out, a guarantee can be released just ahead of a claim its owner can see coming. Releases do not pause yet while a chargeback is open.
 
 ## Build and test
 

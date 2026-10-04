@@ -1707,8 +1707,8 @@ fn replay_drawn(c: &Chargeback, seated: u32, candidate: Option<(u32, &Seat)>, sk
 
 /// Move `amount` of staked coin into the cover (SPEC.md 5.3, 7.5). With no
 /// shares in the cover there is nobody whose cover it would be, and coin put
-/// there would go whole to the next depositor; it is burned instead, which
-/// raises the price for everyone holding coin.
+/// there would go whole to the next depositor; it is burned instead. The coin
+/// was never in the pool, so the price does not move.
 fn into_cover<'info>(
     pool: &mut Account<'info, Pool>,
     cover: &mut Account<'info, Cover>,

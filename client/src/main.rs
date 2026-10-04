@@ -23,7 +23,7 @@
 //!     sasona answer <reading> <nonce hex> --keypair <path>
 //!     sasona uphold <reading> --keypair <path>
 //!     sasona quote <reading> <basis points, 0 to withdraw> --keypair <path>
-//!     sasona buy <reading> <purchase id> <dollars> --keypair <path>
+//!     sasona buy <reading> <purchase id> <dollars> [highest rate] --keypair <path>
 //!     sasona charge-back <purchase> --keypair <path>
 //!     sasona record-draw <purchase> --keypair <path>
 //!     sasona commit-replay <purchase> <service url> <question hash hex> --keypair <path>
@@ -304,6 +304,7 @@ fn main() {
                 stakes: pda(&[STAKES_SEED]),
                 cover: pda(&[COVER_SEED]),
                 cover_vault: pda(&[COVER_VAULT_SEED]),
+                book: pda(&[BOOK_SEED, &r.member.to_le_bytes()]),
                 challenger: c.challenger,
                 challenger_coin: get_associated_token_address(&c.challenger, &coin),
                 token_program: anchor_spl::token::ID,
@@ -316,6 +317,12 @@ fn main() {
         let price = (args[4].parse::<f64>().expect("dollars") * 1_000_000.0).round() as u64;
         let r = reading_of(&reading);
         let quoter: sasona::Member = program.account(member_pda(r.member)).expect("membership");
+        // The rate the buyer accepts: the one standing now, unless named.
+        let max_rate: u16 = match args.get(5) {
+            Some(a) => a.parse().expect("basis points"),
+            None => program.account::<sasona::Quote>(pda(&[QUOTE_SEED, reading.as_ref()])).expect("quote").rate,
+        };
+        eprintln!("highest rate accepted {max_rate} bps");
         eprintln!("purchase {}", pda(&[PURCHASE_SEED, me.as_ref(), &id.to_le_bytes()]));
         request
             .accounts(sasona::accounts::Buy {
@@ -333,7 +340,7 @@ fn main() {
                 token_program: anchor_spl::token::ID,
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
-            .args(sasona::instruction::Buy { id, price })
+            .args(sasona::instruction::Buy { id, price, max_rate })
     } else if command == "charge-back" {
         let purchase: Pubkey = args[2].parse().expect("purchase address");
         let pu: sasona::Purchase = program.account(purchase).expect("purchase");
@@ -447,17 +454,23 @@ fn main() {
     } else if command == "repay-cover" {
         let purchase: Pubkey = args[2].parse().expect("purchase address");
         let (at, c) = chargeback_of(&purchase);
+        let m: sasona::Member = program.account(member_pda(c.member)).expect("membership");
+        // Left with less than a whole stake, the membership gives up its seat.
+        let drained = m.seat > 0 && m.stake.saturating_sub(c.owed_coins) < sasona::MEMBER_STAKE;
         request
             .accounts(sasona::accounts::RepayCover {
                 chargeback: at,
                 book: pda(&[BOOK_SEED, &c.member.to_le_bytes()]),
                 member: member_pda(c.member),
+                members: pda(&[MEMBERS_SEED]),
                 pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
                 stakes: pda(&[STAKES_SEED]),
                 cover: pda(&[COVER_SEED]),
                 cover_vault: pda(&[COVER_VAULT_SEED]),
                 token_program: anchor_spl::token::ID,
             })
+            .accounts(if drained { unseat(c.member) } else { vec![] })
             .args(sasona::instruction::RepayCover {})
     } else if command == "quote" {
         let reading: Pubkey = args[2].parse().expect("reading address");
