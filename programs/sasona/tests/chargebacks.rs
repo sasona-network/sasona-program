@@ -286,6 +286,10 @@ fn the_draw_passes_over_the_buyers_and_the_insurers_seats() {
     let q = sha256(&canonical_question(&[1u8; 16]));
     let err = try_with(&mut m.w.svm, |s| commit_replay_ix(s, buyer.pubkey(), purchase, SERVICE, q), &buyer).unwrap_err();
     assert!(err.contains("NotDrawn") || err.contains("NotSkippable"), "{err}");
+    // Claiming the buyer's seat with every seat before it shown is refused
+    // too: the buyer's seat never qualifies.
+    let err = try_with(&mut m.w.svm, |s| claim_replay_ix(s, purchase, 2, SERVICE, q), &buyer).unwrap_err();
+    assert!(err.contains("NotDrawn"), "{err}");
 }
 
 #[test]
@@ -348,6 +352,10 @@ fn a_declined_draw_is_passed_and_its_seat_passed_over_after() {
     at_slot(&mut m.w.svm, slot, &recent(slot, &[]));
     try_ix(&mut m.w.svm, record_draw_ix(purchase), &buyer).unwrap();
     assert_eq!(replay_drawn_for(&m.w.svm, purchase).0, None);
+    let q = sha256(&canonical_question(&[1u8; 16]));
+    let reader = m.reader.insecure_clone();
+    let err = try_with(&mut m.w.svm, |s| claim_replay_ix(s, purchase, 2, SERVICE, q), &reader).unwrap_err();
+    assert!(err.contains("NotDrawn"), "{err}");
 }
 
 #[test]
@@ -504,11 +512,11 @@ fn the_replayer_is_paid_into_their_own_account_only() {
     charge(&mut m, &buyer, purchase).unwrap();
     replay(&mut m, purchase, 2);
     let mut ix = settle_chargeback_ix(&mut m.w.svm, purchase);
-    let theirs = usd_of(&mut m.w.svm, buyer.pubkey());
+    let someone = new_buyer(&mut m.w.svm, 0);
     let last = ix.accounts.len() - 2;
-    ix.accounts[last].pubkey = theirs;
+    ix.accounts[last].pubkey = ata(someone.pubkey(), usd());
     let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
-    assert!(err.contains("NotTheReader") || err.contains("ConstraintDuplicateMutableAccount"), "{err}");
+    assert!(err.contains("NotTheReader"), "{err}");
 }
 
 #[test]
@@ -607,26 +615,6 @@ fn a_purchase_closes_only_after_its_seven_days_and_not_once_charged_back() {
 }
 
 #[test]
-fn a_paid_chargeback_also_starts_the_thirty_days() {
-    let mut m = market();
-    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
-    let one = buy(&mut m, &buyer, 1, 300_000).unwrap();
-    charge(&mut m, &buyer, one).unwrap();
-    days_pass(&mut m.w.svm, 20);
-    let quoter = m.quoter.insecure_clone();
-    let reading = m.reading;
-    try_with(&mut m.w.svm, |s| set_quote_ix(s, quoter.pubkey(), reading, 150), &quoter).unwrap();
-    let two = buy(&mut m, &buyer, 2, 300_000).unwrap();
-    charge(&mut m, &buyer, two).unwrap();
-    assert!(chargeback(&m.w.svm, two).deposit > 0);
-    // 30 days after the first, but only 10 after the second, which was paid.
-    days_pass(&mut m.w.svm, 7);
-    let three = buy(&mut m, &buyer, 3, 300_000).unwrap();
-    charge(&mut m, &buyer, three).unwrap();
-    assert!(chargeback(&m.w.svm, three).deposit > 0);
-}
-
-#[test]
 fn an_upheld_challenge_pays_the_debt_first_and_the_challenger_a_tenth_of_the_rest() {
     let mut m = market();
     let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
@@ -680,4 +668,62 @@ fn the_price_goes_only_to_the_address_the_reading_recorded() {
     ix.accounts[at].pubkey = ata(own.pubkey(), usd());
     let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
     assert!(err.contains("NotThePayTo"), "{err}");
+}
+
+fn set_last_chargeback(svm: &mut LiteSVM, purchase: Address, at: i64) {
+    let pu: Purchase = read(svm, purchase);
+    let address = pda(&[sasona::SERVICE_SEED, &pu.service]);
+    let mut acc = svm.get_account(&address).unwrap();
+    let mut terms: sasona::ServiceTerms = read(svm, address);
+    terms.last_time = at;
+    let mut data = Vec::new();
+    anchor_lang::AccountSerialize::try_serialize(&terms, &mut data).unwrap();
+    acc.data[..data.len()].copy_from_slice(&data);
+    svm.set_account(address, acc).unwrap();
+}
+
+#[test]
+fn a_paid_chargeback_also_starts_the_thirty_days() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let p: Vec<Address> = (1..=3).map(|id| buy(&mut m, &buyer, id, 300_000).unwrap()).collect();
+    charge(&mut m, &buyer, p[0]).unwrap();
+    // Say the last chargeback on the service was 27 days ago.
+    let now = m.w.svm.get_sysvar::<solana_clock::Clock>().unix_timestamp;
+    set_last_chargeback(&mut m.w.svm, p[0], now - 27 * 86_400);
+    days_pass(&mut m.w.svm, 2);
+    charge(&mut m, &buyer, p[1]).unwrap();
+    assert!(chargeback(&m.w.svm, p[1]).deposit > 0, "29 days after the last");
+    // 31 days after the free one, but 2 after the paid one.
+    days_pass(&mut m.w.svm, 2);
+    charge(&mut m, &buyer, p[2]).unwrap();
+    assert!(chargeback(&m.w.svm, p[2]).deposit > 0, "the paid one restarted the thirty days");
+}
+
+#[test]
+fn a_seat_shown_as_passed_over_must_not_qualify() {
+    // A third member, so that two seats qualify.
+    let mut w = world_with_member();
+    let quoter = w.depositor.insecure_clone();
+    let reading = insured_reading(&mut w, SERVICE, 150, 1_000);
+    let (reader, _) = new_member(&mut w.svm);
+    let (third, _) = new_member(&mut w.svm);
+    w.svm.warp_to_slot(1_100);
+    let mut m = Market { w, quoter, reader, reading };
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    let c = chargeback(&m.w.svm, purchase);
+    at_slot(&mut m.w.svm, c.draw_slot + 40, &recent(c.draw_slot + 40, &[]));
+    try_ix(&mut m.w.svm, record_draw_ix(purchase), &buyer).unwrap();
+    let drawn = replay_drawn_for(&m.w.svm, purchase).0.unwrap();
+    let other = if drawn == 2 { 3 } else { 2 };
+    let order = draw_order(&m.w.svm, purchase);
+    let first_drawn = order.iter().position(|&k| k == drawn).unwrap();
+    assert!(order[first_drawn..].contains(&other), "the draw gives the other seat later too");
+    // The other member claims their seat, showing the drawn seat as passed over.
+    let claimer = if other == 2 { m.reader.insecure_clone() } else { third };
+    let q = sha256(&canonical_question(&[1u8; 16]));
+    let err = try_with(&mut m.w.svm, |s| claim_replay_ix(s, purchase, other, SERVICE, q), &claimer).unwrap_err();
+    assert!(err.contains("NotSkippable"), "{err}");
 }

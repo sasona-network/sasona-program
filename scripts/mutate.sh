@@ -232,7 +232,7 @@ MUTANTS=(
   "uphold: at the deadline|s/require!\(Clock::get\(\)\?\.unix_timestamp > c\.deadline, SasonaError::NotLapsedYet\);/require!(Clock::get()?.unix_timestamp >= c.deadline, SasonaError::NotLapsedYet);/"
   "uphold: upheld twice|s/(pub fn uphold_challenge.*?)\s*require!\(c\.state == CHALLENGE_OPEN, SasonaError::ChallengeClosed\);/\$1/s"
   "uphold: the reading keeps counting|s/\s*ctx\.accounts\.reading\.state = READING_FALSE;//"
-  "uphold: the challenger takes a fifth|s/let reward = stake \/ 10;/let reward = stake \/ 5;/"
+  "uphold: the challenger takes a fifth|s/let reward = \(stake - owed\.min\(stake\)\) \/ 10;/let reward = (stake - owed.min(stake)) \/ 5;/"
   "uphold: the membership is not marked|s/\s*m\.state = MEMBER_SLASHED;//"
   "uphold: a member who asked to leave keeps the stake|s/if state == MEMBER_ACTIVE \|\| state == MEMBER_LEAVING \{/if state == MEMBER_ACTIVE {/"
   "uphold: takes a stake already gone|s/let stake = if state == MEMBER_ACTIVE \|\| state == MEMBER_LEAVING \{ ctx\.accounts\.member\.stake \} else \{ 0 \};/let stake = MEMBER_STAKE;/"

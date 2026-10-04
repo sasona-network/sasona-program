@@ -490,7 +490,9 @@ fn with_nobody_in_the_cover_a_taken_stake_is_burned() {
     w.svm.set_account(pda(&[COVER_SEED]), acc).unwrap();
     put_token_account(&mut w.svm, pda(&[COVER_VAULT_SEED]), pda(&[COIN_SEED]), pda(&[POOL_SEED]), 0);
     let supply = mint_state(&w.svm, pda(&[COIN_SEED])).supply;
+    let outside = pool(&w.svm).outside;
     try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    assert_eq!(pool(&w.svm).outside, outside - (MEMBER_STAKE - MEMBER_STAKE / 10), "the coin burned is no longer outside the pool");
     assert_eq!(cover(&w.svm).coins, 0, "nothing went into a cover nobody holds");
     assert_eq!(mint_state(&w.svm, pda(&[COIN_SEED])).supply, supply - (MEMBER_STAKE - MEMBER_STAKE / 10));
 }

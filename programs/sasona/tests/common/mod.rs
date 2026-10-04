@@ -985,6 +985,40 @@ pub fn commit_replay_ix(svm: &LiteSVM, reader: Address, purchase: Address, endpo
             (owned.iter().copied().find(|&n| member(svm, n).seat > 0).or(owned.first().copied()).unwrap_or(1), vec![])
         }
     };
+    commit_replay_as_ix(svm, reader, number, shown, purchase, endpoint, question_hash)
+}
+
+/// The seats the current draw's attempts give, in order, leaving out numbers
+/// past the roster as the program does.
+pub fn draw_order(svm: &LiteSVM, purchase: Address) -> Vec<u32> {
+    let c = chargeback(svm, purchase);
+    let now = seated(svm);
+    (0..sasona::MAX_READER_ATTEMPTS)
+        .map(|a| sasona::reader_number(&c.seed, &c.service, a, c.draw_members))
+        .filter(|&k| k <= now)
+        .collect()
+}
+
+/// A replay commitment claiming `seat` was drawn, showing every seat the
+/// draw gave before it, whatever the rules say about them.
+pub fn claim_replay_ix(svm: &LiteSVM, purchase: Address, seat_number: u32, endpoint: &str, question_hash: [u8; 32]) -> Instruction {
+    let order = draw_order(svm, purchase);
+    let at = order.iter().position(|&k| k == seat_number).expect("the draw never gives that seat");
+    let s = seat(svm, seat_number);
+    commit_replay_as_ix(svm, addr(s.owner), s.member, order[..at].to_vec(), purchase, endpoint, question_hash)
+}
+
+pub fn commit_replay_as_ix(
+    svm: &LiteSVM,
+    reader: Address,
+    number: u32,
+    shown: Vec<u32>,
+    purchase: Address,
+    endpoint: &str,
+    question_hash: [u8; 32],
+) -> Instruction {
+    let c = chargeback(svm, purchase);
+    let cb = chargeback_address(purchase);
     let m = member_address(number);
     let accounts = sasona::accounts::CommitReplay {
         reader: key(reader),
