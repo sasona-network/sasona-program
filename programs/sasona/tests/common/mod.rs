@@ -501,6 +501,36 @@ pub fn reveal_reading_ix(reader: Address, reading: Address, nonce: [u8; 16], rep
     Instruction { program_id: program_id(), accounts: metas(accounts), data }
 }
 
+pub fn commit_second_ix(reader: Address, round: Address, endpoint: &str, question_hash: [u8; 32], first: Address) -> Instruction {
+    let reading = reading_address(round, endpoint);
+    let accounts = sasona::accounts::CommitSecondReading {
+        reader: key(reader),
+        round: key(round),
+        reading: key(reading),
+        first: key(first),
+        pair: key(pda(&[sasona::PAIR_SEED, reading.as_ref()])),
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::CommitSecondReading {
+        endpoint_hash: sha256(endpoint.as_bytes()),
+        endpoint: endpoint.to_string(),
+        question_hash,
+    }
+    .data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+pub fn settle_pair_ix(first: Address, second: Address) -> Instruction {
+    let accounts = sasona::accounts::SettlePair {
+        pair: key(pda(&[sasona::PAIR_SEED, second.as_ref()])),
+        first: key(first),
+        second: key(second),
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SettlePair {}.data() }
+}
+
 pub fn lapsed_ix(reading: Address) -> Instruction {
     let accounts = sasona::accounts::MarkLapsed { reading: key(reading) }.to_account_metas(None);
     Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::MarkLapsed {}.data() }

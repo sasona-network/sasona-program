@@ -14,6 +14,8 @@
 //!     sasona withheld <candidates file> --keypair <path>
 //!     sasona commit-reading <round> <service url> <question hash hex> --keypair <path>
 //!     sasona reveal-reading <round> <service url> <nonce hex> <reply hash hex> <verdict> --keypair <path>
+//!     sasona commit-second <re-read round> <service url> <question hash hex> <first reading> --keypair <path>
+//!     sasona settle-pair <first reading> <second reading> --keypair <path>
 //!
 //! A round is found by its list's fingerprint. open-round keeps the seed in
 //! `<keypair>.round-<fingerprint>.seed` until it is revealed; anyone who
@@ -29,7 +31,7 @@ use anchor_client::{Client, Cluster, CommitmentConfig};
 use anchor_spl::associated_token::get_associated_token_address;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
-    NONCE_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
+    NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -84,11 +86,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "claim", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair_path = arg(&args, "--keypair").expect(USAGE);
     let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
@@ -283,6 +285,30 @@ fn main() {
                 reply_hash: unhex::<32>(&args[5]),
                 verdict: args[6].parse().expect("verdict"),
             })
+    } else if command == "commit-second" {
+        let round: Pubkey = args[2].parse().expect("re-read round address");
+        let endpoint = args[3].clone();
+        let endpoint_hash: [u8; 32] = sha2::Sha256::digest(endpoint.as_bytes()).into();
+        let reading = pda(&[READING_SEED, round.as_ref(), &endpoint_hash]);
+        request
+            .accounts(sasona::accounts::CommitSecondReading {
+                reader: me,
+                round,
+                reading,
+                first: args[5].parse().expect("first reading address"),
+                pair: pda(&[PAIR_SEED, reading.as_ref()]),
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::CommitSecondReading { endpoint_hash, endpoint, question_hash: unhex::<32>(&args[4]) })
+    } else if command == "settle-pair" {
+        let second: Pubkey = args[3].parse().expect("second reading address");
+        request
+            .accounts(sasona::accounts::SettlePair {
+                pair: pda(&[PAIR_SEED, second.as_ref()]),
+                first: args[2].parse().expect("first reading address"),
+                second,
+            })
+            .args(sasona::instruction::SettlePair {})
     } else if command == "settle" {
         request
             .accounts(sasona::accounts::SettleEntryFees {

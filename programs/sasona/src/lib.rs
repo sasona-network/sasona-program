@@ -141,6 +141,12 @@ pub const READING_COMMITTED: u8 = 0;
 pub const READING_REVEALED: u8 = 1;
 pub const READING_LAPSED: u8 = 2;
 
+/// A second reading's link to the first: sasona-protocol SPEC.md section 3.
+pub const PAIR_SEED: &[u8] = b"pair";
+pub const PAIR_WORKS_NOW: u8 = 1;
+pub const PAIR_FALSE_OR_DECAYED: u8 = 2;
+pub const PAIR_AGREED_FAILS: u8 = 3;
+
 /// NOTE, temporary: who may approve a claim. Deciding claims belongs to
 /// members drawn at random, which is part 7 of the roadmap. Until then it is
 /// the key that can already upgrade this program, so nothing new is trusted.
@@ -509,27 +515,8 @@ pub mod sasona {
         endpoint: String,
         question_hash: [u8; 32],
     ) -> Result<()> {
-        require!(ctx.accounts.round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
-        require!(
-            !endpoint.is_empty()
-                && endpoint.len() <= MAX_ENDPOINT_LEN
-                && endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)),
-            SasonaError::BadEndpoint
-        );
-        require!(
-            solana_sha256_hasher::hashv(&[endpoint.as_bytes()]).to_bytes() == endpoint_hash,
-            SasonaError::BadEndpoint
-        );
-        let r = &mut ctx.accounts.reading;
-        r.round = ctx.accounts.round.key();
-        r.endpoint = endpoint;
-        r.reader = ctx.accounts.reader.key();
-        r.question_hash = question_hash;
-        r.commit_slot = Clock::get()?.slot;
-        r.state = READING_COMMITTED;
-        r.bump = ctx.bumps.reading;
-        emit!(ReadingCommitted { reading: r.key(), round: r.round, question_hash, commit_slot: r.commit_slot });
-        Ok(())
+        let a = &mut *ctx.accounts;
+        start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)
     }
 
     /// Reveal the nonce, the reply's hash and the verdict.
@@ -572,6 +559,50 @@ pub mod sasona {
         r.reveal_slot = now;
         r.state = READING_REVEALED;
         emit!(ReadingRevealed { reading: r.key(), reply_hash, verdict, reveal_slot: now });
+        Ok(())
+    }
+
+    /// Commit a second reading: an ordinary reading in a re-read round that
+    /// names the first reading it re-tests (sasona-protocol SPEC.md 3.2).
+    /// It must be the same service, read by someone else, in another round,
+    /// after the first was revealed.
+    pub fn commit_second_reading(
+        ctx: Context<CommitSecondReading>,
+        endpoint_hash: [u8; 32],
+        endpoint: String,
+        question_hash: [u8; 32],
+    ) -> Result<()> {
+        let first = &ctx.accounts.first;
+        require!(first.state == READING_REVEALED, SasonaError::FirstNotRevealed);
+        require!(first.endpoint == endpoint, SasonaError::NotTheSameService);
+        // Already impossible: in the first's round, the reading address for
+        // this service is the first reading itself. Kept so the rule reads
+        // here as it does in the specification.
+        require!(first.round != ctx.accounts.round.key(), SasonaError::SameRound);
+        require!(first.reader != ctx.accounts.reader.key(), SasonaError::SameReader);
+        let now = Clock::get()?.slot;
+        require!(first.reveal_slot < now, SasonaError::TooEarly);
+        let first_key = first.key();
+
+        let a = &mut *ctx.accounts;
+        start_reading(&a.round, &mut a.reading, a.reader.key(), ctx.bumps.reading, endpoint_hash, endpoint, question_hash)?;
+        let p = &mut a.pair;
+        p.first = first_key;
+        p.second = a.reading.key();
+        p.outcome = 0;
+        p.bump = ctx.bumps.pair;
+        Ok(())
+    }
+
+    /// Record what a pair settled, once its second reading is revealed.
+    /// Anyone may do it; it only reads the two verdicts.
+    pub fn settle_pair(ctx: Context<SettlePair>) -> Result<()> {
+        let second = &ctx.accounts.second;
+        require!(second.state == READING_REVEALED, SasonaError::ReadingNotOpen);
+        let p = &mut ctx.accounts.pair;
+        require!(p.outcome == 0, SasonaError::AlreadySettled);
+        p.outcome = pair_outcome(ctx.accounts.first.verdict, second.verdict);
+        emit!(PairSettled { pair: p.key(), first: p.first, second: p.second, outcome: p.outcome });
         Ok(())
     }
 
@@ -773,6 +804,42 @@ pub mod sasona {
         a.cover.check(a.cover_vault.amount)?;
         emit!(Released { owner: a.owner.key(), shares, coins });
         Ok(())
+    }
+}
+
+/// The checks and records every reading starts with, first or second.
+fn start_reading(
+    round: &Account<Round>,
+    reading: &mut Account<Reading>,
+    reader: Pubkey,
+    bump: u8,
+    endpoint_hash: [u8; 32],
+    endpoint: String,
+    question_hash: [u8; 32],
+) -> Result<()> {
+    require!(round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
+    require!(
+        !endpoint.is_empty() && endpoint.len() <= MAX_ENDPOINT_LEN && endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)),
+        SasonaError::BadEndpoint
+    );
+    require!(solana_sha256_hasher::hashv(&[endpoint.as_bytes()]).to_bytes() == endpoint_hash, SasonaError::BadEndpoint);
+    reading.round = round.key();
+    reading.endpoint = endpoint;
+    reading.reader = reader;
+    reading.question_hash = question_hash;
+    reading.commit_slot = Clock::get()?.slot;
+    reading.state = READING_COMMITTED;
+    reading.bump = bump;
+    emit!(ReadingCommitted { reading: reading.key(), round: reading.round, question_hash, commit_slot: reading.commit_slot });
+    Ok(())
+}
+
+/// sasona-protocol SPEC.md 3.3: what a pair settles, from its two verdicts.
+pub fn pair_outcome(first: u8, second: u8) -> u8 {
+    match (first, second) {
+        (_, 1) => PAIR_WORKS_NOW,
+        (1, _) => PAIR_FALSE_OR_DECAYED,
+        _ => PAIR_AGREED_FAILS,
     }
 }
 
@@ -1169,6 +1236,39 @@ pub struct RevealReading<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(endpoint_hash: [u8; 32])]
+pub struct CommitSecondReading<'info> {
+    #[account(mut, address = round.opener @ SasonaError::NotTheReader)]
+    pub reader: Signer<'info>,
+
+    /// The re-read round.
+    #[account(seeds = [ROUND_SEED, round.pool_fingerprint.as_ref()], bump = round.bump)]
+    pub round: Account<'info, Round>,
+
+    #[account(init, payer = reader, space = 8 + Reading::INIT_SPACE,
+              seeds = [READING_SEED, round.key().as_ref(), endpoint_hash.as_ref()], bump)]
+    pub reading: Account<'info, Reading>,
+
+    /// The reading being re-tested.
+    pub first: Account<'info, Reading>,
+
+    #[account(init, payer = reader, space = 8 + Pair::INIT_SPACE,
+              seeds = [PAIR_SEED, reading.key().as_ref()], bump)]
+    pub pair: Account<'info, Pair>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettlePair<'info> {
+    #[account(mut, seeds = [PAIR_SEED, second.key().as_ref()], bump = pair.bump,
+              has_one = first, has_one = second)]
+    pub pair: Account<'info, Pair>,
+    pub first: Account<'info, Reading>,
+    pub second: Account<'info, Reading>,
+}
+
+#[derive(Accounts)]
 pub struct MarkLapsed<'info> {
     #[account(mut)]
     pub reading: Account<'info, Reading>,
@@ -1411,6 +1511,17 @@ pub struct Reading {
     pub bump: u8,
 }
 
+/// A second reading and the first one it re-tests. The outcome is 0 until
+/// the second is revealed and the pair settled.
+#[account]
+#[derive(InitSpace)]
+pub struct Pair {
+    pub first: Pubkey,
+    pub second: Pubkey,
+    pub outcome: u8,
+    pub bump: u8,
+}
+
 /// A revealed nonce, and the reading it belongs to: the earliest committed of
 /// those that revealed it. A verifier counts a reading only if its nonce's
 /// record names it.
@@ -1549,6 +1660,14 @@ pub struct ReadingRevealed {
     pub reply_hash: [u8; 32],
     pub verdict: u8,
     pub reveal_slot: u64,
+}
+
+#[event]
+pub struct PairSettled {
+    pub pair: Pubkey,
+    pub first: Pubkey,
+    pub second: Pubkey,
+    pub outcome: u8,
 }
 
 #[event]
@@ -1786,6 +1905,16 @@ pub enum SasonaError {
     NotLapsedYet,
     #[msg("That nonce belongs to a reading committed before this one")]
     NonceTaken,
+    #[msg("A second reading re-tests a reading that has been revealed")]
+    FirstNotRevealed,
+    #[msg("A second reading is of the same service as the first")]
+    NotTheSameService,
+    #[msg("A second reading is taken in another round")]
+    SameRound,
+    #[msg("A second reading is taken by someone other than the first reader")]
+    SameReader,
+    #[msg("This pair has already been settled")]
+    AlreadySettled,
     #[msg("Arithmetic overflow")]
     Overflow,
 }
