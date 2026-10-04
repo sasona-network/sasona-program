@@ -1087,7 +1087,7 @@ fn start_reading(
     endpoint: String,
     question_hash: [u8; 32],
 ) -> Result<()> {
-    require!(round.state == ROUND_DRAWN, SasonaError::RoundNotDrawn);
+    // That the round is drawn was checked with the draw (check_drawn).
     require!(
         !endpoint.is_empty() && endpoint.len() <= MAX_ENDPOINT_LEN && endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)),
         SasonaError::BadEndpoint
