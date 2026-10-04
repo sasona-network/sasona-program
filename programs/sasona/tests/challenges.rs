@@ -483,3 +483,24 @@ fn a_pair_whose_first_reading_was_upheld_false_does_not_settle() {
     let err = try_ix(&mut w.svm, settle_pair_ix(first, second), &c).unwrap_err();
     assert!(err.contains("FirstNotRevealed"), "{err}");
 }
+
+#[test]
+fn with_nobody_in_the_cover_a_taken_stake_is_burned() {
+    let mut w = world_with_member();
+    let reading = revealed(&mut w, CANNED, 1);
+    let c = challenger(&mut w.svm);
+    try_with(&mut w.svm, |s| challenge_ix(s, c.pubkey(), reading), &c).unwrap();
+    days_pass(&mut w.svm, 8);
+    // Empty the cover's shares, as the last release out would.
+    let cv: Cover = read(&w.svm, pda(&[COVER_SEED]));
+    let mut data = Vec::new();
+    anchor_lang::AccountSerialize::try_serialize(&Cover { bump: cv.bump, shares: 0, coins: 0 }, &mut data).unwrap();
+    let mut acc = w.svm.get_account(&pda(&[COVER_SEED])).unwrap();
+    acc.data[..data.len()].copy_from_slice(&data);
+    w.svm.set_account(pda(&[COVER_SEED]), acc).unwrap();
+    put_token_account(&mut w.svm, pda(&[COVER_VAULT_SEED]), pda(&[COIN_SEED]), pda(&[POOL_SEED]), 0);
+    let supply = mint_state(&w.svm, pda(&[COIN_SEED])).supply;
+    try_with(&mut w.svm, |s| uphold_ix(s, reading), &c).unwrap();
+    assert_eq!(cover(&w.svm).coins, 0, "nothing went into a cover nobody holds");
+    assert_eq!(mint_state(&w.svm, pda(&[COIN_SEED])).supply, supply - (MEMBER_STAKE - MEMBER_STAKE / 10));
+}

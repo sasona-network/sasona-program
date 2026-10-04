@@ -791,6 +791,7 @@ pub fn uphold_ix(svm: &LiteSVM, reading: Address) -> Instruction {
         stakes: key(pda(&[sasona::STAKES_SEED])),
         cover: key(pda(&[COVER_SEED])),
         cover_vault: key(pda(&[COVER_VAULT_SEED])),
+        book: key(book_address(r.member)),
         challenger: c.challenger,
         challenger_coin: key(ata(addr(c.challenger), coin)),
         token_program: anchor_spl::token::ID,
@@ -880,6 +881,16 @@ pub fn usd_of(svm: &mut LiteSVM, who: Address) -> Address {
 /// The merchant's and the quoter's dollar accounts must exist already, as
 /// `insured_reading` leaves them.
 pub fn buy_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, reading: Address, id: u64, price: u64) -> Instruction {
+    let rate = svm
+        .get_account(&quote_address(reading))
+        .and_then(|a| sasona::Quote::try_deserialize(&mut a.data.as_slice()).ok())
+        .map(|q| q.rate)
+        .unwrap_or(0);
+    buy_at_ix(svm, buyer, buyer_usd, reading, id, price, rate)
+}
+
+/// A purchase accepting at most `max_rate`.
+pub fn buy_at_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, reading: Address, id: u64, price: u64, max_rate: u16) -> Instruction {
     let r: sasona::Reading = read(svm, reading);
     let quoter = member(svm, r.member).owner;
     let merchant = Address::new_from_array([78u8; 32]);
@@ -900,7 +911,7 @@ pub fn buy_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, reading: Addres
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
-    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Buy { id, price }.data() }
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::Buy { id, price, max_rate }.data() }
 }
 
 pub fn close_purchase_ix(svm: &LiteSVM, purchase: Address) -> Instruction {
@@ -1052,14 +1063,22 @@ pub fn repay_cover_ix(svm: &LiteSVM, purchase: Address) -> Instruction {
         chargeback: key(chargeback_address(purchase)),
         book: key(book_address(c.member)),
         member: key(member_address(c.member)),
+        members: key(members_address()),
         pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
         stakes: key(pda(&[sasona::STAKES_SEED])),
         cover: key(pda(&[COVER_SEED])),
         cover_vault: key(pda(&[COVER_VAULT_SEED])),
         token_program: anchor_spl::token::ID,
     }
     .to_account_metas(None);
-    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::RepayCover {}.data() }
+    let mut accounts = metas(accounts);
+    // If what is taken leaves less than a whole stake, the membership leaves its seat.
+    let m = member(svm, c.member);
+    if m.seat > 0 && m.stake.saturating_sub(c.owed_coins) < sasona::MEMBER_STAKE {
+        accounts.extend(unseat_accounts(svm, c.member));
+    }
+    Instruction { program_id: program_id(), accounts, data: sasona::instruction::RepayCover {}.data() }
 }
 
 /// In a world with the pool open: membership 1 (the depositor) reads

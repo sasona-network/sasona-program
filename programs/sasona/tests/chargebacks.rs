@@ -362,8 +362,8 @@ fn a_draw_whose_entropy_was_never_recorded_still_counts() {
     at_slot(&mut m.w.svm, c.draw_slot + 40, &recent(c.draw_slot + 40, &[]));
     let err = try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &anyone).unwrap_err();
     assert!(err.contains("TooEarly"), "{err}");
-    // Long gone from SlotHashes.
-    let late = c.draw_slot + 2_000;
+    // Long gone from SlotHashes, and its hour over.
+    let late = c.draw_slot + 32 + READ_WINDOW_SLOTS + 1;
     at_slot(&mut m.w.svm, late, &recent(late, &[]));
     try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &anyone).unwrap();
     let c = chargeback(&m.w.svm, purchase);
@@ -381,7 +381,7 @@ fn after_eight_passed_draws_the_buyer_is_paid_and_the_insurer_owes_it() {
     assert!(err.contains("NotLapsedYet"), "{err}");
     for _ in 0..8 {
         let c = chargeback(&m.w.svm, purchase);
-        let late = c.draw_slot + 2_000;
+        let late = c.draw_slot + 32 + READ_WINDOW_SLOTS + 1;
         at_slot(&mut m.w.svm, late, &recent(late, &[]));
         try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &anyone).unwrap();
     }
@@ -441,6 +441,7 @@ fn the_insurer_pays_the_cover_back_once_their_reading_can_no_longer_be_challenge
     assert_eq!(cover(&m.w.svm).coins, cover_before + owed);
     assert_eq!(member(&m.w.svm, 1).stake, MEMBER_STAKE - owed);
     assert_eq!(book(&m.w.svm, 1).owed_coins, 0);
+    assert_eq!(member(&m.w.svm, 1).seat, 0, "less than a whole stake is not a membership any more");
     assert_books_balance(&m.w.svm);
     let err = try_with(&mut m.w.svm, |s| repay_cover_ix(s, purchase), &anyone).unwrap_err();
     assert!(err.contains("NothingOwed"), "{err}");
@@ -460,4 +461,167 @@ fn what_the_insurer_owes_takes_room_to_insure() {
     let err = buy(&mut m, &buyer, 2, PRICE).unwrap_err();
     assert!(err.contains("NoRoomToInsure"), "{err}");
     buy(&mut m, &buyer, 2, 500_000).unwrap();
+}
+
+#[test]
+fn a_member_whose_stake_was_taken_down_leaves_their_seat() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    replay(&mut m, purchase, 2);
+    settle(&mut m, purchase).unwrap();
+    let r: sasona::Reading = read(&m.w.svm, m.reading);
+    let now = m.w.svm.get_sysvar::<solana_clock::Clock>().unix_timestamp;
+    days_pass(&mut m.w.svm, (r.reveal_time + CHALLENGE_WINDOW_SECONDS - now) / 86_400 + 1);
+    let anyone = m.reader.insecure_clone();
+    try_with(&mut m.w.svm, |s| repay_cover_ix(s, purchase), &anyone).unwrap();
+    let quoter = member(&m.w.svm, 1);
+    assert_eq!((quoter.seat, quoter.state), (0, sasona::MEMBER_LEAVING));
+    // It reads nothing more, and insures nothing more.
+    let err = buy(&mut m, &buyer, 2, 300_000).unwrap_err();
+    assert!(err.contains("NotActive") || err.contains("WindowClosed"), "{err}");
+    assert_eq!(seated(&m.w.svm), 1, "b alone is seated");
+}
+
+#[test]
+fn a_raised_quote_does_not_charge_a_buyer_who_saw_the_old_one() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let quoter = m.quoter.insecure_clone();
+    let reading = m.reading;
+    try_with(&mut m.w.svm, |s| set_quote_ix(s, quoter.pubkey(), reading, 10_000), &quoter).unwrap();
+    let usd_acc = ata(buyer.pubkey(), usd());
+    let err = try_with(&mut m.w.svm, |s| buy_at_ix(s, buyer.pubkey(), usd_acc, reading, 1, PRICE, 150), &buyer).unwrap_err();
+    assert!(err.contains("RateRaised"), "{err}");
+}
+
+#[test]
+fn the_replayer_is_paid_into_their_own_account_only() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    replay(&mut m, purchase, 2);
+    let mut ix = settle_chargeback_ix(&mut m.w.svm, purchase);
+    let theirs = usd_of(&mut m.w.svm, buyer.pubkey());
+    let last = ix.accounts.len() - 2;
+    ix.accounts[last].pubkey = theirs;
+    let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("NotTheReader") || err.contains("ConstraintDuplicateMutableAccount"), "{err}");
+}
+
+#[test]
+fn seven_days_with_no_replay_pay_the_buyer() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    days_pass(&mut m.w.svm, 7);
+    let err = settle(&mut m, purchase).unwrap_err();
+    assert!(err.contains("NotLapsedYet"), "{err}");
+    days_pass(&mut m.w.svm, 1);
+    let before = usd_balance(&m.w.svm, buyer.pubkey());
+    settle(&mut m, purchase).unwrap();
+    assert_eq!(usd_balance(&m.w.svm, buyer.pubkey()), before + PRICE);
+}
+
+#[test]
+fn settling_waits_for_a_replay_that_can_still_be_revealed() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    let c = chargeback(&m.w.svm, purchase);
+    let slot = c.draw_slot + 40;
+    at_slot(&mut m.w.svm, slot, &recent(slot, &[]));
+    let reader = m.reader.insecure_clone();
+    try_ix(&mut m.w.svm, record_draw_ix(purchase), &reader).unwrap();
+    let q = sha256(&canonical_question(&[1u8; 16]));
+    try_with(&mut m.w.svm, |s| commit_replay_ix(s, reader.pubkey(), purchase, SERVICE, q), &reader).unwrap();
+    days_pass(&mut m.w.svm, 8);
+    let err = settle(&mut m, purchase).unwrap_err();
+    assert!(err.contains("ReplayStands"), "{err}");
+}
+
+#[test]
+fn a_draw_never_recorded_counts_only_once_its_hour_is_over() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    let c = chargeback(&m.w.svm, purchase);
+    let anyone = m.reader.insecure_clone();
+    // Gone from SlotHashes after a few minutes, but its hour is not over.
+    let gone = c.draw_slot + 2_000;
+    at_slot(&mut m.w.svm, gone, &recent(gone, &[]));
+    let err = try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &anyone).unwrap_err();
+    assert!(err.contains("TooEarly"), "{err}");
+    let late = c.draw_slot + 32 + READ_WINDOW_SLOTS + 1;
+    at_slot(&mut m.w.svm, late, &recent(late, &[]));
+    try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &anyone).unwrap();
+}
+
+#[test]
+fn a_pass_must_show_the_seat_the_draw_gave() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    charge(&mut m, &buyer, purchase).unwrap();
+    let c = chargeback(&m.w.svm, purchase);
+    at_slot(&mut m.w.svm, c.draw_slot + 40, &recent(c.draw_slot + 40, &[]));
+    try_ix(&mut m.w.svm, record_draw_ix(purchase), &buyer).unwrap();
+    let entropy_slot = chargeback(&m.w.svm, purchase).entropy_slot;
+    m.w.svm.warp_to_slot(entropy_slot + READ_WINDOW_SLOTS + 1);
+    // Claim the quoter's seat was the one drawn, to have them marked declined.
+    let mut ix = pass_draw_ix(&m.w.svm, purchase);
+    ix.data = anchor_lang::InstructionData::data(&sasona::instruction::PassDraw { drawn_seat: 1 });
+    ix.accounts.truncate(4);
+    ix.accounts.push(AccountMeta::new_readonly(seat_address(1), false));
+    let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("NotDrawn") || err.contains("NotSkippable"), "{err}");
+    // Or show one account too many.
+    let mut ix = pass_draw_ix(&m.w.svm, purchase);
+    ix.accounts.push(AccountMeta::new_readonly(seat_address(1), false));
+    let err = try_ix(&mut m.w.svm, ix, &buyer).unwrap_err();
+    assert!(err.contains("NotDrawn"), "{err}");
+    try_with(&mut m.w.svm, |s| pass_draw_ix(s, purchase), &buyer).unwrap();
+}
+
+#[test]
+fn a_purchase_closes_only_after_its_seven_days_and_not_once_charged_back() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
+    let pu: Purchase = read(&m.w.svm, purchase);
+    let mut c: solana_clock::Clock = m.w.svm.get_sysvar();
+    c.unix_timestamp = pu.made_time + 7 * 86_400;
+    m.w.svm.set_sysvar(&c);
+    let anyone = m.reader.insecure_clone();
+    let err = try_with(&mut m.w.svm, |s| close_purchase_ix(s, purchase), &anyone).unwrap_err();
+    assert!(err.contains("NotLapsedYet"), "at exactly seven days it can still be charged back: {err}");
+    charge(&mut m, &buyer, purchase).unwrap();
+    days_pass(&mut m.w.svm, 1);
+    let err = try_with(&mut m.w.svm, |s| close_purchase_ix(s, purchase), &anyone).unwrap_err();
+    assert!(err.contains("NotOpen"), "{err}");
+}
+
+#[test]
+fn a_paid_chargeback_also_starts_the_thirty_days() {
+    let mut m = market();
+    let buyer = new_buyer(&mut m.w.svm, 10 * DOLLAR);
+    let one = buy(&mut m, &buyer, 1, 300_000).unwrap();
+    charge(&mut m, &buyer, one).unwrap();
+    days_pass(&mut m.w.svm, 20);
+    let quoter = m.quoter.insecure_clone();
+    let reading = m.reading;
+    try_with(&mut m.w.svm, |s| set_quote_ix(s, quoter.pubkey(), reading, 150), &quoter).unwrap();
+    let two = buy(&mut m, &buyer, 2, 300_000).unwrap();
+    charge(&mut m, &buyer, two).unwrap();
+    assert!(chargeback(&m.w.svm, two).deposit > 0);
+    // 30 days after the first, but only 10 after the second, which was paid.
+    days_pass(&mut m.w.svm, 7);
+    let three = buy(&mut m, &buyer, 3, 300_000).unwrap();
+    charge(&mut m, &buyer, three).unwrap();
+    assert!(chargeback(&m.w.svm, three).deposit > 0);
 }
