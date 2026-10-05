@@ -376,11 +376,13 @@ fn a_signature_check_that_is_too_short_or_points_outside_is_refused() {
     tail.extend(sig.as_ref());
     tail.extend(&message);
 
-    // A message length other than 90: the payer signed the first 89 bytes.
+    // A message length other than 90. All 90 bytes are there, but the
+    // ed25519 program is told to check 89: the signature, over the first 89,
+    // would leave the amount's last byte unsigned.
     let short = c.payer.sign_message(&message[..89]);
     let mut t89 = c.payer.pubkey().to_bytes().to_vec();
     t89.extend(short.as_ref());
-    t89.extend(&message[..89]);
+    t89.extend(&message);
     let v = ed25519_raw(1, [48, u16::MAX, 16, u16::MAX, 112, 89, u16::MAX], &t89);
     let err = pay_with(&mut c, v, 1_000).unwrap_err();
     assert!(err.contains("BadVoucher"), "89 bytes: {err}");
