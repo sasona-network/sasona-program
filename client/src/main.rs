@@ -115,8 +115,13 @@ fn seed_file(keypair_path: &str, fingerprint: &[u8; 32]) -> String {
     format!("{keypair_path}.round-{hex}.seed")
 }
 
-const ED25519: Pubkey = anchor_client::anchor_lang::pubkey!("Ed25519SigVerify111111111111111111111111111");
-const INSTRUCTIONS: Pubkey = anchor_client::anchor_lang::pubkey!("Sysvar1nstructions1111111111111111111111111");
+fn ed25519_program() -> Pubkey {
+    "Ed25519SigVerify111111111111111111111111111".parse().unwrap()
+}
+
+fn instructions_sysvar() -> Pubkey {
+    "Sysvar1nstructions1111111111111111111111111".parse().unwrap()
+}
 
 fn pda(seeds: &[&[u8]]) -> Pubkey {
     Pubkey::find_program_address(seeds, &sasona::ID).0
@@ -759,14 +764,14 @@ fn main() {
         data.extend(c.signer.as_ref());
         data.extend(signature);
         data.extend(sasona::voucher_message(&channel, units));
-        let check = anchor_client::Instruction { program_id: ED25519, accounts: vec![], data };
+        let check = anchor_client::Instruction { program_id: ed25519_program(), accounts: vec![], data };
         request
             .instruction(check)
             .accounts(sasona::accounts::TakePayment {
                 channel,
                 channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
                 payee_usd: get_associated_token_address(&c.payee, &USD_MINT),
-                instructions: INSTRUCTIONS,
+                instructions: instructions_sysvar(),
                 token_program: anchor_spl::token::ID,
             })
             .args(sasona::instruction::TakePayment { amount: units })
