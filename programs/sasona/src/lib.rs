@@ -232,11 +232,13 @@ pub const VOUCHER_LEN: usize = 90;
 pub const NOTICE_SLOTS: u64 = 648_000;
 /// Which cluster a voucher is good on (8.3). A build for mainnet carries
 /// another number, so that a devnet voucher is worth nothing there.
-#[cfg(not(feature = "mainnet"))]
+/// It is set with USD_MINT: a build that carries devnet's number also names
+/// devnet's dollar, which does not exist on mainnet, so no channel could be
+/// opened there. Until mainnet's dollar is chosen, a mainnet build does not
+/// compile.
 pub const CLUSTER: u8 = 1;
 #[cfg(feature = "mainnet")]
-pub const CLUSTER: u8 = 2;
-const _: () = assert!(cfg!(feature = "mainnet") == (CLUSTER != 1), "a mainnet build must not carry devnet's cluster number");
+compile_error!("mainnet needs its own dollar (USD_MINT) and its own CLUSTER number, set together");
 
 #[program]
 pub mod sasona {
@@ -467,6 +469,7 @@ pub mod sasona {
         let a = &ctx.accounts;
         a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
 
+        fees_cover(a.fees.amount, &a.pool, &a.markup)?;
         emit!(EntryFeesSettled { amount, burned, shared });
         Ok(())
     }
@@ -1037,6 +1040,8 @@ pub mod sasona {
         let held = &mut ctx.accounts.markup;
         held.held = add(held.held, m)?;
         held.bump = ctx.bumps.markup;
+        ctx.accounts.fees.reload()?;
+        fees_cover(ctx.accounts.fees.amount, &ctx.accounts.pool, &ctx.accounts.markup)?;
 
         let number = ctx.accounts.member.number;
         let reading = ctx.accounts.reading.key();
@@ -1059,7 +1064,7 @@ pub mod sasona {
         pu.due_time = due;
         pu.state = PURCHASE_OPEN;
         pu.bump = ctx.bumps.purchase;
-        emit!(Bought { purchase: pu.key(), buyer: pu.buyer, reading, price, premium });
+        emit!(Bought { purchase: pu.key(), buyer: pu.buyer, reading, price, premium, markup: m });
         Ok(())
     }
 
@@ -1425,7 +1430,9 @@ pub mod sasona {
         let c = &mut ctx.accounts.channel;
         c.put_in = add(c.put_in, amount)?;
         ctx.accounts.channel_usd.reload()?;
-        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)?;
+        emit!(ChannelFunded { channel: ctx.accounts.channel.key(), amount, put_in: ctx.accounts.channel.put_in });
+        Ok(())
     }
 
     /// Pay a channel's payee against a voucher (SPEC.md 8.4). Anyone may
@@ -1479,7 +1486,9 @@ pub mod sasona {
         held.bump = ctx.bumps.markup;
         ctx.accounts.channel.owed = 0;
         ctx.accounts.channel_usd.reload()?;
-        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)?;
+        emit!(ChannelSwept { channel: ctx.accounts.channel.key(), markup: owed });
+        Ok(())
     }
 
     /// The payer asks to take a channel back. Once, and for good: the payee
@@ -1487,7 +1496,8 @@ pub mod sasona {
     pub fn ask_to_close_channel(ctx: Context<AskToCloseChannel>) -> Result<()> {
         let c = &mut ctx.accounts.channel;
         require!(c.asked == 0, SasonaError::AlreadyAsked);
-        c.asked = Clock::get()?.slot;
+        // 0 means "not asked", so a slot of 0 counts as 1.
+        c.asked = Clock::get()?.slot.max(1);
         emit!(ChannelCloseAsked { channel: c.key(), at: c.asked });
         Ok(())
     }
@@ -1576,6 +1586,7 @@ pub mod sasona {
         ctx.accounts.fees.reload()?;
         let a = &ctx.accounts;
         a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        fees_cover(a.fees.amount, &a.pool, &a.markup)?;
         emit!(MarkupSettled { amount, reserve: f.reserve, burned, shared });
         Ok(())
     }
@@ -1992,6 +2003,14 @@ fn into_cover<'info>(
     Ok(())
 }
 
+/// The fee account holds the entry fees waiting and the markup waiting,
+/// both. Checked together, so that neither can be spent from the other's
+/// dollars.
+fn fees_cover(fees: u64, pool: &Pool, markup: &MarkupHeld) -> Result<()> {
+    require!(fees as u128 >= pool.fees_held as u128 + markup.held as u128, SasonaError::DollarsMissing);
+    Ok(())
+}
+
 /// SPEC.md 8.1: 15% of a price, rounded up.
 pub fn markup_of(price: u64) -> Result<u64> {
     u64::try_from((price as u128 * MARKUP_POINTS as u128).div_ceil(100)).map_err(|_| SasonaError::Overflow.into())
@@ -2404,6 +2423,11 @@ pub struct SettleEntryFees<'info> {
 
     #[account(mut, seeds = [FEES_SEED], bump)]
     pub fees: Account<'info, TokenAccount>,
+
+    /// Read only to check that the fee account holds both what entry fees
+    /// and markups are owed.
+    #[account(init_if_needed, payer = caller, space = 8 + MarkupHeld::INIT_SPACE, seeds = [MARKUP_SEED], bump)]
+    pub markup: Account<'info, MarkupHeld>,
 
     #[account(init_if_needed, payer = caller, seeds = [NETWORK_SEED], bump,
               token::mint = coin_mint, token::authority = pool)]
@@ -3738,6 +3762,7 @@ pub struct Bought {
     pub reading: Pubkey,
     pub price: u64,
     pub premium: u64,
+    pub markup: u64,
 }
 
 #[event]
@@ -3777,6 +3802,19 @@ pub struct ChannelPaid {
     pub channel: Pubkey,
     pub voucher: u64,
     pub paid: u64,
+    pub markup: u64,
+}
+
+#[event]
+pub struct ChannelFunded {
+    pub channel: Pubkey,
+    pub amount: u64,
+    pub put_in: u64,
+}
+
+#[event]
+pub struct ChannelSwept {
+    pub channel: Pubkey,
     pub markup: u64,
 }
 

@@ -228,7 +228,11 @@ fn a_failed_replay_pays_the_buyer_and_the_replayer_and_the_insurer_owes_it() {
     let reader_before = usd_balance(&m.w.svm, m.reader.pubkey());
     let cover_before = cover(&m.w.svm).coins;
     let open_before = book(&m.w.svm, 1).open_usd;
+    // 7.5: the markup the purchase paid stays with the network.
+    let held = markup_held(&m.w.svm);
+    let fees = token_balance(&m.w.svm, pda(&[sasona::FEES_SEED]));
     settle(&mut m, purchase).unwrap();
+    assert_eq!((markup_held(&m.w.svm), token_balance(&m.w.svm, pda(&[sasona::FEES_SEED]))), (held, fees));
     assert_eq!(usd_balance(&m.w.svm, buyer.pubkey()), buyer_before + PRICE + deposit, "the price, and the deposit back");
     assert_eq!(usd_balance(&m.w.svm, m.reader.pubkey()), reader_before + FEE, "the replayer is paid");
     let c = chargeback(&m.w.svm, purchase);

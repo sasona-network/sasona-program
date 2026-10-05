@@ -55,7 +55,7 @@ use anchor_client::anchor_lang::prelude::AccountMeta;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
     NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
-    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, BOOK_SEED, CHARGEBACK_SEED, ESCROW_SEED, PURCHASE_SEED, SERVICE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
+    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, MARKUP_SEED, BOOK_SEED, CHARGEBACK_SEED, ESCROW_SEED, PURCHASE_SEED, SERVICE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -337,6 +337,8 @@ fn main() {
                 purchase: pda(&[PURCHASE_SEED, me.as_ref(), &id.to_le_bytes()]),
                 merchant_usd: get_associated_token_address(&r.pay_to, &USD_MINT),
                 quoter_usd: get_associated_token_address(&quoter.owner, &USD_MINT),
+                fees: pda(&[FEES_SEED]),
+                markup: pda(&[MARKUP_SEED]),
                 token_program: anchor_spl::token::ID,
                 system_program: anchor_client::anchor_lang::system_program::ID,
             })
@@ -689,6 +691,7 @@ fn main() {
                 pool_usd: pda(&[POOL_USD_SEED]),
                 pool_coin: pda(&[POOL_COIN_SEED]),
                 fees: pda(&[FEES_SEED]),
+                markup: pda(&[MARKUP_SEED]),
                 network: pda(&[NETWORK_SEED]),
                 token_program: anchor_spl::token::ID,
                 system_program: anchor_client::anchor_lang::system_program::ID,

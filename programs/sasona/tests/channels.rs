@@ -366,3 +366,67 @@ fn the_markup_turns_into_coin_with_its_reserve() {
     assert!(err.contains("NothingDeposited"), "{err}");
     assert_books_balance(&c.w.svm);
 }
+
+#[test]
+fn a_signature_check_that_is_too_short_or_points_outside_is_refused() {
+    let mut c = setup();
+    let message = sasona::voucher_message(&key(c.ch), 1_000);
+    let sig = c.payer.sign_message(&message);
+    let mut tail = c.payer.pubkey().to_bytes().to_vec();
+    tail.extend(sig.as_ref());
+    tail.extend(&message);
+
+    // A message length other than 90: the payer signed the first 89 bytes.
+    let short = c.payer.sign_message(&message[..89]);
+    let mut t89 = c.payer.pubkey().to_bytes().to_vec();
+    t89.extend(short.as_ref());
+    t89.extend(&message[..89]);
+    let v = ed25519_raw(1, [48, u16::MAX, 16, u16::MAX, 112, 89, u16::MAX], &t89);
+    let err = pay_with(&mut c, v, 1_000).unwrap_err();
+    assert!(err.contains("BadVoucher"), "89 bytes: {err}");
+
+    // Fewer than 16 bytes: no room for a header. The ed25519 program may
+    // refuse it first; either way nothing is paid.
+    let v = Instruction { program_id: addr(ED25519), accounts: vec![], data: vec![1, 0, 48, 0] };
+    assert!(pay_with(&mut c, v, 1_000).is_err());
+    assert_eq!(payee_usd(&c), 0);
+
+    pay_with(&mut c, ed25519_raw(1, [48, u16::MAX, 16, u16::MAX, 112, 90, u16::MAX], &tail), 1_000).unwrap();
+    assert_eq!(payee_usd(&c), 1_000);
+}
+
+#[test]
+fn the_payee_may_close_after_the_notice_too() {
+    let mut c = setup();
+    pay(&mut c, 100_000).unwrap();
+    let payer = c.payer.insecure_clone();
+    try_ix(&mut c.w.svm, ask_to_close_channel_ix(payer.pubkey(), c.ch), &payer).unwrap();
+    let asked = channel(&c.w.svm, c.ch).asked;
+    c.w.svm.warp_to_slot(asked + sasona::NOTICE_SLOTS + 10);
+    let payee = c.payee.insecure_clone();
+    close_by(&mut c, &payee).unwrap();
+    assert_eq!(usd_balance(&c.w.svm, payer.pubkey()), 10 * DOLLAR - 100_000 - 15_000);
+}
+
+#[test]
+fn entry_fees_and_markup_share_the_fee_account_without_spending_each_other() {
+    let mut c = setup();
+    // Entry fees waiting, from a deposit, and markup waiting, from a channel.
+    let (k, from) = newcomer(&mut c.w.svm, 100);
+    try_deposit(&mut c.w.svm, &k, from, 100 * DOLLAR).unwrap();
+    pay(&mut c, 600_000).unwrap();
+    sweep(&mut c).unwrap();
+    let entry = pool(&c.w.svm).fees_held;
+    assert!(entry > 0);
+    assert_eq!(markup_held(&c.w.svm), 90_000);
+    let fees_before = fees(&c);
+    let caller = c.payee.insecure_clone();
+    try_ix(&mut c.w.svm, settle_ix(caller.pubkey()), &caller).unwrap();
+    assert_eq!(fees(&c), fees_before - entry);
+    assert_eq!(markup_held(&c.w.svm), 90_000, "the entry fees took nothing of the markup");
+    let network_before = token_balance(&c.w.svm, pda(&[NETWORK_SEED]));
+    try_ix(&mut c.w.svm, settle_markup_ix(caller.pubkey()), &caller).unwrap();
+    assert_eq!(fees(&c), fees_before - entry - 90_000);
+    assert!(token_balance(&c.w.svm, pda(&[NETWORK_SEED])) > network_before, "the participants' share went to the network");
+    assert_books_balance(&c.w.svm);
+}

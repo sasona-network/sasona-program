@@ -263,6 +263,7 @@ pub fn settle_ix(caller: Address) -> Instruction {
         pool_usd: key(pda(&[POOL_USD_SEED])),
         pool_coin: key(pda(&[POOL_COIN_SEED])),
         fees: key(pda(&[FEES_SEED])),
+        markup: key(pda(&[sasona::MARKUP_SEED])),
         network: key(pda(&[NETWORK_SEED])),
         token_program: anchor_spl::token::ID,
         system_program: anchor_lang::system_program::ID,
