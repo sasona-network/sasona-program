@@ -50,7 +50,7 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `commit_replay` | The drawn member commits a reading of the service, as for a round. It is revealed with `reveal_reading`. |
 | `pass_draw` | After the hour to read, counts a draw nobody used, and draws again. After 8 the chargeback can be settled. |
 | `settle_chargeback` | Pays out what the replay decided: the buyer back out of the cover, or the deposit to the replayer. 7 days with no replay pays the buyer. |
-| `open_channel` | Puts a payer's dollars in a channel for one payee, paid out against vouchers a named key signs offline. Each payer's channels take identifiers in order, so no channel address is ever used twice. |
+| `open_channel` | Puts an agent's dollars in a channel for the node that buys for it, paid out against vouchers a named key signs offline. Each payer's channels take identifiers in order, so no channel address is ever used twice. |
 | `add_to_channel` | The payer adds dollars, while no close is pending. |
 | `take_payment` | Pays the payee against a voucher, checked by the ed25519 program in the instruction before. A voucher is cumulative, and pays what the channel can cover. The markup on what was taken is kept in the channel, owed to the network. |
 | `sweep_channel` | Moves a channel's markup owed to the network's fee account. Anyone can call it. |
