@@ -13,6 +13,7 @@ use sasona::{
 const SERVICE: &str = "https://sandbox.example.net/run/python";
 const PRICE: u64 = DOLLAR;
 const FEE: u64 = DOLLAR / 20;
+const MARKUP: u64 = PRICE * 15 / 100;
 
 fn usd_balance(svm: &LiteSVM, who: Address) -> u64 {
     token_balance(svm, ata(who, usd()))
@@ -80,10 +81,15 @@ fn a_covered_purchase_pays_the_merchant_and_the_premium() {
     let merchant = merchant_usd(&mut m.w.svm);
     let merchant_before = token_balance(&m.w.svm, merchant);
     let quoter_before = usd_balance(&m.w.svm, m.quoter.pubkey());
+    let fees_before = token_balance(&m.w.svm, pda(&[sasona::FEES_SEED]));
     let purchase = buy(&mut m, &buyer, 1, PRICE).unwrap();
     assert_eq!(token_balance(&m.w.svm, merchant), merchant_before + PRICE);
     assert_eq!(usd_balance(&m.w.svm, m.quoter.pubkey()), quoter_before + PRICE * 150 / 10_000);
-    assert_eq!(usd_balance(&m.w.svm, buyer.pubkey()), 10 * DOLLAR - PRICE - PRICE * 150 / 10_000);
+    // SPEC.md 8.1: and the markup, 15% of the price rounded up, held for the network.
+    assert_eq!(MARKUP, 150_000);
+    assert_eq!(usd_balance(&m.w.svm, buyer.pubkey()), 10 * DOLLAR - PRICE - PRICE * 150 / 10_000 - MARKUP);
+    assert_eq!(token_balance(&m.w.svm, pda(&[sasona::FEES_SEED])), fees_before + MARKUP);
+    assert_eq!(markup_held(&m.w.svm), MARKUP);
     let pu: Purchase = read(&m.w.svm, purchase);
     assert_eq!((addr(pu.buyer), addr(pu.reading), pu.member, pu.price, pu.counted), (buyer.pubkey(), m.reading, 1, PRICE, PRICE + FEE));
     let b: Book = book(&m.w.svm, 1);

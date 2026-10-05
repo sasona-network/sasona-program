@@ -220,6 +220,24 @@ pub const PURCHASE_CLOSED: u8 = 2;
 pub const CHARGEBACK_OPEN: u8 = 0;
 pub const CHARGEBACK_SETTLED: u8 = 1;
 
+/// Payment channels (SPEC.md section 8).
+pub const CHANNEL_SEED: &[u8] = b"channel";
+pub const CHANNEL_USD_SEED: &[u8] = b"channel_usd";
+pub const PAYER_SEED: &[u8] = b"payer";
+pub const MARKUP_SEED: &[u8] = b"markup";
+pub const VOUCHER_DOMAIN: &[u8] = b"sasona/voucher/v1";
+pub const VOUCHER_LEN: usize = 90;
+/// The notice a payer gives before taking a channel back: about 72 hours.
+/// In slots, so that a cluster that stops does not use it up (8.5).
+pub const NOTICE_SLOTS: u64 = 648_000;
+/// Which cluster a voucher is good on (8.3). A build for mainnet carries
+/// another number, so that a devnet voucher is worth nothing there.
+#[cfg(not(feature = "mainnet"))]
+pub const CLUSTER: u8 = 1;
+#[cfg(feature = "mainnet")]
+pub const CLUSTER: u8 = 2;
+const _: () = assert!(cfg!(feature = "mainnet") == (CLUSTER != 1), "a mainnet build must not carry devnet's cluster number");
+
 #[program]
 pub mod sasona {
     use super::*;
@@ -1005,6 +1023,20 @@ pub mod sasona {
                 premium,
             )?;
         }
+        // SPEC.md 8.1: the markup every purchase carries, held until anyone
+        // turns it into coin. It is not counted in the room to insure, and a
+        // chargeback does not return it.
+        let m = markup_of(price)?;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.buyer_usd.to_account_info(), to: a.fees.to_account_info(), authority: a.buyer.to_account_info() },
+            ),
+            m,
+        )?;
+        let held = &mut ctx.accounts.markup;
+        held.held = add(held.held, m)?;
+        held.bump = ctx.bumps.markup;
 
         let number = ctx.accounts.member.number;
         let reading = ctx.accounts.reading.key();
@@ -1334,6 +1366,217 @@ pub mod sasona {
         let a = &ctx.accounts;
         require!(a.coin_mint.supply == a.pool.coin_reserve + a.pool.outside, SasonaError::SupplyMismatch);
         emit!(CoverRepaid { chargeback: ctx.accounts.chargeback.key(), owed, taken: take });
+        Ok(())
+    }
+
+    /// Open a payment channel: the payer's dollars, held by the program for
+    /// one payee, paid out against vouchers the signer signs (SPEC.md 8.2).
+    ///
+    /// `id` must be the payer's next identifier, so that no channel address
+    /// is ever used twice and no voucher from an earlier channel can come
+    /// back to life.
+    pub fn open_channel(ctx: Context<OpenChannel>, payee: Pubkey, id: u64, amount: u64) -> Result<()> {
+        require!(amount > 0, SasonaError::NothingDeposited);
+        let record = &mut ctx.accounts.record;
+        require!(id == record.next_id, SasonaError::NotTheNextId);
+        record.next_id = id.checked_add(1).ok_or(SasonaError::Overflow)?;
+        record.bump = ctx.bumps.record;
+        let signer = ctx.accounts.voucher_signer.key();
+        require!(signer != payee, SasonaError::SignerIsPayee);
+        // Money paid to these would be counted by nobody (8.2).
+        let (pool, _) = Pubkey::find_program_address(&[POOL_SEED], &crate::ID);
+        let (network, _) = Pubkey::find_program_address(&[NETWORK_SEED], &crate::ID);
+        require!(payee != pool && payee != network, SasonaError::NotAPayee);
+
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.payer_usd.to_account_info(), to: a.channel_usd.to_account_info(), authority: a.payer.to_account_info() },
+            ),
+            amount,
+        )?;
+        let payer = ctx.accounts.payer.key();
+        let c = &mut ctx.accounts.channel;
+        c.payer = payer;
+        c.payee = payee;
+        c.id = id;
+        c.signer = signer;
+        c.put_in = amount;
+        c.bump = ctx.bumps.channel;
+        ctx.accounts.channel_usd.reload()?;
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)?;
+        emit!(ChannelOpened { channel: ctx.accounts.channel.key(), payer, payee, signer, amount });
+        Ok(())
+    }
+
+    /// The payer adds dollars to a channel with no close pending.
+    pub fn add_to_channel(ctx: Context<AddToChannel>, amount: u64) -> Result<()> {
+        require!(amount > 0, SasonaError::NothingDeposited);
+        require!(ctx.accounts.channel.asked == 0, SasonaError::ClosePending);
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.payer_usd.to_account_info(), to: a.channel_usd.to_account_info(), authority: a.payer.to_account_info() },
+            ),
+            amount,
+        )?;
+        let c = &mut ctx.accounts.channel;
+        c.put_in = add(c.put_in, amount)?;
+        ctx.accounts.channel_usd.reload()?;
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)
+    }
+
+    /// Pay a channel's payee against a voucher (SPEC.md 8.4). Anyone may
+    /// send it; the money can only reach the payee.
+    ///
+    /// The voucher's signature is checked by the ed25519 program in the
+    /// instruction just before this one, which this one reads back (8.6).
+    pub fn take_payment(ctx: Context<TakePayment>, amount: u64) -> Result<()> {
+        let c = &ctx.accounts.channel;
+        let slot = Clock::get()?.slot;
+        require!(c.asked == 0 || slot < notice_end(c.asked)?, SasonaError::NoticeOver);
+        let message = voucher_message(&ctx.accounts.channel.key(), amount);
+        check_voucher(&ctx.accounts.instructions, &c.signer, &message)?;
+
+        let x = payable(amount, c.put_in);
+        require!(x > c.taken, SasonaError::NothingMoreToPay);
+        let to_payee = x - c.taken;
+        let charge = markup_of(x)?.checked_sub(c.charged).ok_or(SasonaError::Overflow)?;
+
+        let id = c.id.to_le_bytes();
+        let bump = [c.bump];
+        let seeds: &[&[u8]] = &[CHANNEL_SEED, c.payer.as_ref(), c.payee.as_ref(), &id, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.channel_usd.to_account_info(), to: a.payee_usd.to_account_info(), authority: a.channel.to_account_info() },
+            )
+            .with_signer(signer),
+            to_payee,
+        )?;
+        let c = &mut ctx.accounts.channel;
+        c.taken = x;
+        c.charged = add(c.charged, charge)?;
+        c.owed = add(c.owed, charge)?;
+        ctx.accounts.channel_usd.reload()?;
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)?;
+        emit!(ChannelPaid { channel: ctx.accounts.channel.key(), voucher: amount, paid: to_payee, markup: charge });
+        Ok(())
+    }
+
+    /// Move a channel's markup owed to the network's fee account. Anyone
+    /// may send it.
+    pub fn sweep_channel(ctx: Context<SweepChannel>) -> Result<()> {
+        let owed = ctx.accounts.channel.owed;
+        require!(owed > 0, SasonaError::NothingOwed);
+        move_markup(&ctx.accounts.channel, &ctx.accounts.channel_usd, &ctx.accounts.fees, &ctx.accounts.token_program, owed)?;
+        let held = &mut ctx.accounts.markup;
+        held.held = add(held.held, owed)?;
+        held.bump = ctx.bumps.markup;
+        ctx.accounts.channel.owed = 0;
+        ctx.accounts.channel_usd.reload()?;
+        ctx.accounts.channel.check(ctx.accounts.channel_usd.amount)
+    }
+
+    /// The payer asks to take a channel back. Once, and for good: the payee
+    /// has NOTICE_SLOTS to take its last voucher (8.5).
+    pub fn ask_to_close_channel(ctx: Context<AskToCloseChannel>) -> Result<()> {
+        let c = &mut ctx.accounts.channel;
+        require!(c.asked == 0, SasonaError::AlreadyAsked);
+        c.asked = Clock::get()?.slot;
+        emit!(ChannelCloseAsked { channel: c.key(), at: c.asked });
+        Ok(())
+    }
+
+    /// Close a channel: by its payee at any time, or by anyone once the
+    /// payer's notice is over. The markup owed goes to the network, and
+    /// everything else in the channel's account, with both rents, to the
+    /// payer.
+    pub fn close_channel(ctx: Context<CloseChannel>) -> Result<()> {
+        let c = &ctx.accounts.channel;
+        if ctx.accounts.closer.key() != c.payee {
+            require!(c.asked != 0 && Clock::get()?.slot >= notice_end(c.asked)?, SasonaError::NoticeNotOver);
+        }
+        let owed = c.owed;
+        if owed > 0 {
+            move_markup(&ctx.accounts.channel, &ctx.accounts.channel_usd, &ctx.accounts.fees, &ctx.accounts.token_program, owed)?;
+            let held = &mut ctx.accounts.markup;
+            held.held = add(held.held, owed)?;
+        }
+        ctx.accounts.markup.bump = ctx.bumps.markup;
+        ctx.accounts.channel_usd.reload()?;
+        // Everything left, including anything sent to the account from
+        // outside: a token account can only be closed empty.
+        let rest = ctx.accounts.channel_usd.amount;
+        let c = &ctx.accounts.channel;
+        let id = c.id.to_le_bytes();
+        let bump = [c.bump];
+        let seeds: &[&[u8]] = &[CHANNEL_SEED, c.payer.as_ref(), c.payee.as_ref(), &id, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        if rest > 0 {
+            token::transfer(
+                CpiContext::new(
+                    a.token_program.key(),
+                    Transfer { from: a.channel_usd.to_account_info(), to: a.payer_usd.to_account_info(), authority: a.channel.to_account_info() },
+                )
+                .with_signer(signer),
+                rest,
+            )?;
+        }
+        token::close_account(
+            CpiContext::new(
+                a.token_program.key(),
+                CloseAccount { account: a.channel_usd.to_account_info(), destination: a.payer.to_account_info(), authority: a.channel.to_account_info() },
+            )
+            .with_signer(signer),
+        )?;
+        emit!(ChannelClosed { channel: a.channel.key(), markup: owed, returned: rest });
+        Ok(())
+    }
+
+    /// Turn the markup held into coin, as the fee table sets: 5 of its 15
+    /// points stay in the pool as depth, and the rest buys coin, 3% burned
+    /// and the rest for the participants, whose share goes to the network
+    /// for now (SPEC.md 8.1). Anyone may send it.
+    pub fn settle_markup(ctx: Context<SettleMarkup>) -> Result<()> {
+        let amount = ctx.accounts.markup.held;
+        require!(amount > 0, SasonaError::NothingDeposited);
+        let f = Fee::of(amount)?;
+        let bump = [ctx.accounts.pool.bump];
+        let seeds: &[&[u8]] = &[POOL_SEED, &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        let a = &ctx.accounts;
+        token::transfer(
+            CpiContext::new(
+                a.token_program.key(),
+                Transfer { from: a.fees.to_account_info(), to: a.pool_usd.to_account_info(), authority: a.pool.to_account_info() },
+            )
+            .with_signer(signer),
+            amount,
+        )?;
+        ctx.accounts.markup.held = 0;
+        let pool = &mut ctx.accounts.pool;
+        pool.usd_reserve = add(pool.usd_reserve, f.reserve)?;
+        let (burned, shared) = buy_and_share(
+            &mut ctx.accounts.pool,
+            &ctx.accounts.token_program,
+            &ctx.accounts.coin_mint,
+            &ctx.accounts.pool_coin,
+            &ctx.accounts.network,
+            f.buy(),
+            f.burn,
+        )?;
+        ctx.accounts.coin_mint.reload()?;
+        ctx.accounts.pool_usd.reload()?;
+        ctx.accounts.fees.reload()?;
+        let a = &ctx.accounts;
+        a.pool.check(a.coin_mint.supply, a.pool_usd.amount, a.fees.amount)?;
+        emit!(MarkupSettled { amount, reserve: f.reserve, burned, shared });
         Ok(())
     }
 
@@ -1747,6 +1990,74 @@ fn into_cover<'info>(
         cover.coins = cover.coins.checked_add(amount).ok_or(SasonaError::Overflow)?;
     }
     Ok(())
+}
+
+/// SPEC.md 8.1: 15% of a price, rounded up.
+pub fn markup_of(price: u64) -> Result<u64> {
+    u64::try_from((price as u128 * MARKUP_POINTS as u128).div_ceil(100)).map_err(|_| SasonaError::Overflow.into())
+}
+
+/// SPEC.md 8.4: the most a channel holding `put_in` can pay on a voucher.
+pub fn payable(voucher: u64, put_in: u64) -> u64 {
+    voucher.min((put_in as u128 * 100 / (100 + MARKUP_POINTS as u128)) as u64)
+}
+
+fn notice_end(asked: u64) -> Result<u64> {
+    asked.checked_add(NOTICE_SLOTS).ok_or(SasonaError::Overflow.into())
+}
+
+/// SPEC.md 8.3: the 90 bytes a voucher's signer signs.
+pub fn voucher_message(channel: &Pubkey, amount: u64) -> [u8; VOUCHER_LEN] {
+    let mut m = [0u8; VOUCHER_LEN];
+    m[..17].copy_from_slice(VOUCHER_DOMAIN);
+    m[17..49].copy_from_slice(crate::ID.as_ref());
+    m[49] = CLUSTER;
+    m[50..82].copy_from_slice(channel.as_ref());
+    m[82..].copy_from_slice(&amount.to_be_bytes());
+    m
+}
+
+/// SPEC.md 8.6: the instruction before this one is the ed25519 program,
+/// checking exactly one signature whose key and message lie in that same
+/// instruction, read through its own offsets; the key is the channel's
+/// signer and the message the voucher's.
+fn check_voucher(instructions: &AccountInfo, signer: &Pubkey, message: &[u8; VOUCHER_LEN]) -> Result<()> {
+    let current = solana_instructions_sysvar::load_current_index_checked(instructions)? as usize;
+    require!(current > 0, SasonaError::NoVoucher);
+    let ix = solana_instructions_sysvar::load_instruction_at_checked(current - 1, instructions)?;
+    require_keys_eq!(ix.program_id, solana_sdk_ids::ed25519_program::ID, SasonaError::NoVoucher);
+    let d = &ix.data;
+    require!(d.len() >= 16 && d[0] == 1, SasonaError::BadVoucher);
+    let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]) as usize;
+    let (key_offset, message_offset, message_len) = (at(6), at(10), at(12));
+    require!(at(4) == u16::MAX as usize && at(8) == u16::MAX as usize && at(14) == u16::MAX as usize, SasonaError::BadVoucher);
+    require!(message_len == VOUCHER_LEN, SasonaError::BadVoucher);
+    let key = d.get(key_offset..key_offset + 32).ok_or(SasonaError::BadVoucher)?;
+    let signed = d.get(message_offset..message_offset + VOUCHER_LEN).ok_or(SasonaError::BadVoucher)?;
+    require!(key == signer.as_ref() && signed == message.as_slice(), SasonaError::BadVoucher);
+    Ok(())
+}
+
+/// Move `amount` of a channel's markup owed from its account to the fees.
+fn move_markup<'info>(
+    channel: &Account<'info, Channel>,
+    channel_usd: &Account<'info, TokenAccount>,
+    fees: &Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+    amount: u64,
+) -> Result<()> {
+    let id = channel.id.to_le_bytes();
+    let bump = [channel.bump];
+    let seeds: &[&[u8]] = &[CHANNEL_SEED, channel.payer.as_ref(), channel.payee.as_ref(), &id, &bump];
+    let signer: &[&[&[u8]]] = &[seeds];
+    token::transfer(
+        CpiContext::new(
+            token_program.key(),
+            Transfer { from: channel_usd.to_account_info(), to: fees.to_account_info(), authority: channel.to_account_info() },
+        )
+        .with_signer(signer),
+        amount,
+    )
 }
 
 /// The replayer's dollar account, which must be theirs.
@@ -2596,6 +2907,12 @@ pub struct Buy<'info> {
     #[account(mut, token::mint = usd_mint, constraint = quoter_usd.owner == member.owner @ SasonaError::NotTheOwner)]
     pub quoter_usd: Account<'info, TokenAccount>,
 
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = buyer, space = 8 + MarkupHeld::INIT_SPACE, seeds = [MARKUP_SEED], bump)]
+    pub markup: Account<'info, MarkupHeld>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -2787,6 +3104,215 @@ pub struct RepayCover<'info> {
 }
 
 // --------------------------------------------------------------------- state
+
+#[derive(Accounts)]
+#[instruction(payee: Pubkey, id: u64)]
+pub struct OpenChannel<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// The key whose vouchers the channel honours. It signs the opening, to
+    /// show it is held (8.2); it may be the payer.
+    pub voucher_signer: Signer<'info>,
+
+    #[account(mut, token::mint = usd_mint, token::authority = payer)]
+    pub payer_usd: Account<'info, TokenAccount>,
+
+    #[account(address = USD_MINT @ SasonaError::NotTheDollar)]
+    pub usd_mint: Account<'info, Mint>,
+
+    #[account(init_if_needed, payer = payer, space = 8 + PayerRecord::INIT_SPACE,
+              seeds = [PAYER_SEED, payer.key().as_ref()], bump)]
+    pub record: Account<'info, PayerRecord>,
+
+    #[account(init, payer = payer, space = 8 + Channel::INIT_SPACE,
+              seeds = [CHANNEL_SEED, payer.key().as_ref(), payee.as_ref(), id.to_le_bytes().as_ref()], bump)]
+    pub channel: Account<'info, Channel>,
+
+    #[account(init, payer = payer, seeds = [CHANNEL_USD_SEED, channel.key().as_ref()], bump,
+              token::mint = usd_mint, token::authority = channel)]
+    pub channel_usd: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AddToChannel<'info> {
+    pub payer: Signer<'info>,
+
+    #[account(mut, token::mint = USD_MINT, token::authority = payer)]
+    pub payer_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, has_one = payer @ SasonaError::NotTheOwner)]
+    pub channel: Account<'info, Channel>,
+
+    #[account(mut, seeds = [CHANNEL_USD_SEED, channel.key().as_ref()], bump)]
+    pub channel_usd: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct TakePayment<'info> {
+    #[account(mut)]
+    pub channel: Account<'info, Channel>,
+
+    #[account(mut, seeds = [CHANNEL_USD_SEED, channel.key().as_ref()], bump)]
+    pub channel_usd: Account<'info, TokenAccount>,
+
+    /// The payee's dollar account (8.4).
+    #[account(mut, token::mint = USD_MINT, constraint = payee_usd.owner == channel.payee @ SasonaError::NotThePayee)]
+    pub payee_usd: Account<'info, TokenAccount>,
+
+    /// CHECK: the instructions sysvar, by address; read through
+    /// solana_instructions_sysvar.
+    #[account(address = solana_sdk_ids::sysvar::instructions::ID)]
+    pub instructions: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SweepChannel<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(mut)]
+    pub channel: Account<'info, Channel>,
+
+    #[account(mut, seeds = [CHANNEL_USD_SEED, channel.key().as_ref()], bump)]
+    pub channel_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = caller, space = 8 + MarkupHeld::INIT_SPACE, seeds = [MARKUP_SEED], bump)]
+    pub markup: Account<'info, MarkupHeld>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AskToCloseChannel<'info> {
+    pub payer: Signer<'info>,
+
+    #[account(mut, has_one = payer @ SasonaError::NotTheOwner)]
+    pub channel: Account<'info, Channel>,
+}
+
+#[derive(Accounts)]
+pub struct CloseChannel<'info> {
+    /// The payee, at any time; anyone, once the payer's notice is over.
+    #[account(mut)]
+    pub closer: Signer<'info>,
+
+    /// CHECK: the channel's payer, who gets the rent back.
+    #[account(mut, address = channel.payer @ SasonaError::NotTheOwner)]
+    pub payer: UncheckedAccount<'info>,
+
+    #[account(mut, token::mint = USD_MINT, constraint = payer_usd.owner == channel.payer @ SasonaError::NotTheOwner)]
+    pub payer_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, close = payer)]
+    pub channel: Account<'info, Channel>,
+
+    #[account(mut, seeds = [CHANNEL_USD_SEED, channel.key().as_ref()], bump)]
+    pub channel_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(init_if_needed, payer = closer, space = 8 + MarkupHeld::INIT_SPACE, seeds = [MARKUP_SEED], bump)]
+    pub markup: Account<'info, MarkupHeld>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettleMarkup<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(mut, seeds = [POOL_SEED], bump = pool.bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut, address = pool.coin_mint)]
+    pub coin_mint: Account<'info, Mint>,
+
+    #[account(mut, seeds = [POOL_USD_SEED], bump)]
+    pub pool_usd: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [POOL_COIN_SEED], bump)]
+    pub pool_coin: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [FEES_SEED], bump)]
+    pub fees: Account<'info, TokenAccount>,
+
+    #[account(mut, seeds = [MARKUP_SEED], bump = markup.bump)]
+    pub markup: Account<'info, MarkupHeld>,
+
+    #[account(init_if_needed, payer = caller, seeds = [NETWORK_SEED], bump,
+              token::mint = coin_mint, token::authority = pool)]
+    pub network: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+/// A payment channel (SPEC.md 8.2).
+#[account]
+#[derive(InitSpace)]
+pub struct Channel {
+    pub payer: Pubkey,
+    pub payee: Pubkey,
+    pub id: u64,
+    /// The key whose vouchers the channel honours.
+    pub signer: Pubkey,
+    /// Everything the payer has put in.
+    pub put_in: u64,
+    /// The largest voucher amount paid out so far.
+    pub taken: u64,
+    /// The markup charged on `taken`: markup_of(taken).
+    pub charged: u64,
+    /// Of `charged`, what is still in the channel's account.
+    pub owed: u64,
+    /// The slot the payer asked to close in, or 0.
+    pub asked: u64,
+    pub bump: u8,
+}
+
+impl Channel {
+    /// SPEC.md 8.2, after every instruction that touches a channel: the
+    /// books add up, and the account holds at least what they say. More is
+    /// allowed, because anyone can send dollars to it.
+    pub fn check(&self, balance: u64) -> Result<()> {
+        let out = add(self.taken, self.charged)?;
+        require!(out <= self.put_in, SasonaError::DollarsMissing);
+        let moved = self.charged - self.owed;
+        require!(balance as u128 + self.taken as u128 + moved as u128 >= self.put_in as u128, SasonaError::DollarsMissing);
+        Ok(())
+    }
+}
+
+/// The next identifier for a payer's channels. Never closed (8.2).
+#[account]
+#[derive(InitSpace)]
+pub struct PayerRecord {
+    pub next_id: u64,
+    pub bump: u8,
+}
+
+/// The markup in the fee account waiting to be turned into coin (8.1). Its
+/// own account rather than a field of the pool, which is full.
+#[account]
+#[derive(InitSpace)]
+pub struct MarkupHeld {
+    pub held: u64,
+    pub bump: u8,
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -3238,6 +3764,44 @@ pub struct ChargebackSettled {
 }
 
 #[event]
+pub struct ChannelOpened {
+    pub channel: Pubkey,
+    pub payer: Pubkey,
+    pub payee: Pubkey,
+    pub signer: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct ChannelPaid {
+    pub channel: Pubkey,
+    pub voucher: u64,
+    pub paid: u64,
+    pub markup: u64,
+}
+
+#[event]
+pub struct ChannelCloseAsked {
+    pub channel: Pubkey,
+    pub at: u64,
+}
+
+#[event]
+pub struct ChannelClosed {
+    pub channel: Pubkey,
+    pub markup: u64,
+    pub returned: u64,
+}
+
+#[event]
+pub struct MarkupSettled {
+    pub amount: u64,
+    pub reserve: u64,
+    pub burned: u64,
+    pub shared: u64,
+}
+
+#[event]
 pub struct CoverRepaid {
     pub chargeback: Pubkey,
     pub owed: u64,
@@ -3591,6 +4155,26 @@ pub enum SasonaError {
     StillInsuring,
     #[msg("The quote was raised past the rate the buyer accepted")]
     RateRaised,
+    #[msg("A channel's identifier must be the payer's next one")]
+    NotTheNextId,
+    #[msg("The key that signs vouchers cannot be the payee")]
+    SignerIsPayee,
+    #[msg("This address cannot be paid through a channel")]
+    NotAPayee,
+    #[msg("The payer has asked to close this channel")]
+    ClosePending,
+    #[msg("The notice to close is over")]
+    NoticeOver,
+    #[msg("The payer has already asked to close")]
+    AlreadyAsked,
+    #[msg("Nothing more can be paid on this voucher")]
+    NothingMoreToPay,
+    #[msg("No voucher signature before this instruction")]
+    NoVoucher,
+    #[msg("The voucher's signature check is not the one required")]
+    BadVoucher,
+    #[msg("Not the payee's dollar account")]
+    NotThePayee,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

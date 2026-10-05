@@ -907,6 +907,8 @@ pub fn buy_at_ix(svm: &LiteSVM, buyer: Address, buyer_usd: Address, reading: Add
         purchase: key(purchase_address(buyer, id)),
         merchant_usd: key(merchant),
         quoter_usd: key(quoter_usd),
+        fees: key(pda(&[sasona::FEES_SEED])),
+        markup: key(pda(&[sasona::MARKUP_SEED])),
         token_program: anchor_spl::token::ID,
         system_program: anchor_lang::system_program::ID,
     }
@@ -1161,7 +1163,8 @@ pub fn pay_back(w: &mut World, dollars: u64) -> Result<Address, String> {
         let slot = w.svm.get_sysvar::<solana_clock::Clock>().slot.max(1) + 1_000;
         insured_reading(w, SERVICE, 100, slot);
     }
-    let buyer = new_buyer(&mut w.svm, dollars + dollars / 10 + 1);
+    // The price, its premium and its markup (SPEC.md 8.1).
+    let buyer = new_buyer(&mut w.svm, dollars + dollars / 5 + 1);
     let usd_acc = ata(buyer.pubkey(), usd());
     let id = 1;
     try_with(&mut w.svm, |s| buy_ix(s, buyer.pubkey(), usd_acc, reading, id, dollars), &buyer)?;
@@ -1185,4 +1188,159 @@ pub fn challenger(svm: &mut LiteSVM) -> Keypair {
     let (k, usd) = newcomer(svm, 10);
     try_deposit(svm, &k, usd, 10 * DOLLAR).unwrap();
     k
+}
+
+/// The markup waiting in the fee account to be turned into coin (SPEC.md 8.1).
+pub fn markup_held(svm: &LiteSVM) -> u64 {
+    svm.get_account(&pda(&[sasona::MARKUP_SEED]))
+        .map(|a| sasona::MarkupHeld::try_deserialize(&mut a.data.as_slice()).unwrap().held)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------- channels
+
+pub const ED25519: anchor_lang::prelude::Pubkey = anchor_lang::pubkey!("Ed25519SigVerify111111111111111111111111111");
+pub const INSTRUCTIONS: anchor_lang::prelude::Pubkey = anchor_lang::pubkey!("Sysvar1nstructions1111111111111111111111111");
+
+pub fn channel_address(payer: Address, payee: Address, id: u64) -> Address {
+    pda(&[sasona::CHANNEL_SEED, payer.as_ref(), payee.as_ref(), &id.to_le_bytes()])
+}
+
+pub fn channel_usd_address(channel: Address) -> Address {
+    pda(&[sasona::CHANNEL_USD_SEED, channel.as_ref()])
+}
+
+pub fn channel(svm: &LiteSVM, at: Address) -> sasona::Channel {
+    read(svm, at)
+}
+
+pub fn open_channel_ix(payer: Address, signer: Address, payee: Address, id: u64, amount: u64) -> Instruction {
+    let ch = channel_address(payer, payee, id);
+    let accounts = sasona::accounts::OpenChannel {
+        payer: key(payer),
+        voucher_signer: key(signer),
+        payer_usd: key(ata(payer, usd())),
+        usd_mint: key(usd()),
+        record: key(pda(&[sasona::PAYER_SEED, payer.as_ref()])),
+        channel: key(ch),
+        channel_usd: key(channel_usd_address(ch)),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = sasona::instruction::OpenChannel { payee: key(payee), id, amount }.data();
+    Instruction { program_id: program_id(), accounts: metas(accounts), data }
+}
+
+pub fn add_to_channel_ix(payer: Address, ch: Address, amount: u64) -> Instruction {
+    let accounts = sasona::accounts::AddToChannel {
+        payer: key(payer),
+        payer_usd: key(ata(payer, usd())),
+        channel: key(ch),
+        channel_usd: key(channel_usd_address(ch)),
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AddToChannel { amount }.data() }
+}
+
+/// The ed25519 program's instruction, laid out by hand so that a test can
+/// lay it out wrong: `fields` are the signature offset and instruction,
+/// the key offset and instruction, the message offset, size and instruction.
+pub fn ed25519_raw(count: u8, fields: [u16; 7], tail: &[u8]) -> Instruction {
+    let mut d = vec![count, 0];
+    for f in fields {
+        d.extend(f.to_le_bytes());
+    }
+    d.extend(tail);
+    Instruction { program_id: addr(ED25519), accounts: vec![], data: d }
+}
+
+/// The ordinary layout: key at 16, signature at 48, message at 112, all in
+/// this instruction.
+pub fn ed25519_ix(public: Address, signature: &[u8], message: &[u8]) -> Instruction {
+    let mut tail = public.to_bytes().to_vec();
+    tail.extend(signature);
+    tail.extend(message);
+    ed25519_raw(1, [48, u16::MAX, 16, u16::MAX, 112, message.len() as u16, u16::MAX], &tail)
+}
+
+/// A voucher for `amount` on `ch`, signed by `signer`.
+pub fn voucher_ix(signer: &Keypair, ch: Address, amount: u64) -> Instruction {
+    let message = sasona::voucher_message(&key(ch), amount);
+    let sig = signer.sign_message(&message);
+    ed25519_ix(signer.pubkey(), sig.as_ref(), &message)
+}
+
+pub fn take_payment_ix(svm: &LiteSVM, ch: Address, amount: u64) -> Instruction {
+    let c = channel(svm, ch);
+    let accounts = sasona::accounts::TakePayment {
+        channel: key(ch),
+        channel_usd: key(channel_usd_address(ch)),
+        payee_usd: key(ata(addr(c.payee), usd())),
+        instructions: INSTRUCTIONS,
+        token_program: anchor_spl::token::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::TakePayment { amount }.data() }
+}
+
+pub fn sweep_channel_ix(caller: Address, ch: Address) -> Instruction {
+    let accounts = sasona::accounts::SweepChannel {
+        caller: key(caller),
+        channel: key(ch),
+        channel_usd: key(channel_usd_address(ch)),
+        fees: key(pda(&[FEES_SEED])),
+        markup: key(pda(&[sasona::MARKUP_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SweepChannel {}.data() }
+}
+
+pub fn ask_to_close_channel_ix(payer: Address, ch: Address) -> Instruction {
+    let accounts = sasona::accounts::AskToCloseChannel { payer: key(payer), channel: key(ch) }.to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::AskToCloseChannel {}.data() }
+}
+
+pub fn close_channel_ix(svm: &LiteSVM, closer: Address, ch: Address) -> Instruction {
+    let c = channel(svm, ch);
+    let accounts = sasona::accounts::CloseChannel {
+        closer: key(closer),
+        payer: c.payer,
+        payer_usd: key(ata(addr(c.payer), usd())),
+        channel: key(ch),
+        channel_usd: key(channel_usd_address(ch)),
+        fees: key(pda(&[FEES_SEED])),
+        markup: key(pda(&[sasona::MARKUP_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::CloseChannel {}.data() }
+}
+
+pub fn settle_markup_ix(caller: Address) -> Instruction {
+    let accounts = sasona::accounts::SettleMarkup {
+        caller: key(caller),
+        pool: key(pda(&[POOL_SEED])),
+        coin_mint: key(pda(&[COIN_SEED])),
+        pool_usd: key(pda(&[POOL_USD_SEED])),
+        pool_coin: key(pda(&[POOL_COIN_SEED])),
+        fees: key(pda(&[FEES_SEED])),
+        markup: key(pda(&[sasona::MARKUP_SEED])),
+        network: key(pda(&[NETWORK_SEED])),
+        token_program: anchor_spl::token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    Instruction { program_id: program_id(), accounts: metas(accounts), data: sasona::instruction::SettleMarkup {}.data() }
+}
+
+/// Several instructions in one transaction; the first signer pays.
+pub fn send_all(svm: &mut LiteSVM, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(ixs, Some(&signers[0].pubkey()), signers, svm.latest_blockhash());
+    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}\n{}", e.err, e.meta.logs.join("\n")))
 }
