@@ -31,6 +31,19 @@
 //!     sasona pass-draw <purchase> --keypair <path>
 //!     sasona settle-chargeback <purchase> --keypair <path>
 //!     sasona repay-cover <purchase> --keypair <path>
+//!     sasona open-channel <payee> <id> <dollars> [--signer <path>] --keypair <path>
+//!     sasona add-to-channel <channel> <dollars> --keypair <path>
+//!     sasona voucher <channel> <units> --keypair <signer path>
+//!     sasona take-payment <channel> <units> <signature hex> --keypair <path>
+//!     sasona sweep-channel <channel> --keypair <path>
+//!     sasona ask-close-channel <channel> --keypair <path>
+//!     sasona close-channel <channel> --keypair <path>
+//!     sasona settle-markup --keypair <path>
+//!
+//! voucher signs offline and prints the signature: the 90 bytes of
+//! sasona-protocol SPEC.md 8.3, for the channel and the amount in dollar
+//! units (a millionth of a dollar), everything taken so far. take-payment
+//! puts that signature before the payment, for the ed25519 program to check.
 //!
 //! reveal-reading and reveal-replay take [--pay-to <address>]: where the
 //! service asked to be paid (sasona-protocol SPEC.md 7.1).
@@ -55,7 +68,7 @@ use anchor_client::anchor_lang::prelude::AccountMeta;
 use sasona::{
     COIN_SEED, COVER_SEED, COVER_VAULT_SEED, EXIT_SEED, FEES_SEED, GUARANTEE_SEED, NETWORK_SEED, POOL_COIN_SEED,
     NONCE_SEED, PAIR_SEED, POOL_SEED, POOL_USD_SEED, READING_SEED, ROUND_SEED, USD_MINT, VAULT_SEED,
-    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, MARKUP_SEED, BOOK_SEED, CHARGEBACK_SEED, ESCROW_SEED, PURCHASE_SEED, SERVICE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
+    CHALLENGE_SEED, EVIDENCE_SEED, QUOTE_SEED, MARKUP_SEED, CHANNEL_SEED, CHANNEL_USD_SEED, PAYER_SEED, BOOK_SEED, CHARGEBACK_SEED, ESCROW_SEED, PURCHASE_SEED, SERVICE_SEED, HELD_SEED, MEMBERS_SEED, MEMBER_SEED, SEAT_SEED, STAKES_SEED,
 };
 use solana_keypair::read_keypair_file;
 use sha2::Digest;
@@ -102,6 +115,9 @@ fn seed_file(keypair_path: &str, fingerprint: &[u8; 32]) -> String {
     format!("{keypair_path}.round-{hex}.seed")
 }
 
+const ED25519: Pubkey = anchor_client::anchor_lang::pubkey!("Ed25519SigVerify111111111111111111111111111");
+const INSTRUCTIONS: Pubkey = anchor_client::anchor_lang::pubkey!("Sysvar1nstructions1111111111111111111111111");
+
 fn pda(seeds: &[&[u8]]) -> Pubkey {
     Pubkey::find_program_address(seeds, &sasona::ID).0
 }
@@ -109,11 +125,11 @@ fn pda(seeds: &[&[u8]]) -> Pubkey {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !["open", "deposit", "fee", "settle", "depth", "join", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover"].contains(&command.as_str()) {
+    if !["open", "deposit", "fee", "settle", "depth", "join", "ask-back", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover", "open-channel", "add-to-channel", "voucher", "take-payment", "sweep-channel", "ask-close-channel", "close-channel", "settle-markup"].contains(&command.as_str()) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
+    let dollars: f64 = if ["settle", "join", "release", "open-round", "reveal-round", "withheld", "commit-reading", "reveal-reading", "commit-second", "settle-pair", "member-join", "member-ask-leave", "member-leave", "challenge", "evidence", "answer", "uphold", "quote", "buy", "charge-back", "record-draw", "commit-replay", "reveal-replay", "pass-draw", "settle-chargeback", "repay-cover", "open-channel", "add-to-channel", "voucher", "take-payment", "sweep-channel", "ask-close-channel", "close-channel", "settle-markup"].contains(&command.as_str()) { 0.0 } else { args.get(2).and_then(|s| s.parse().ok()).expect(USAGE) };
     let amount = (dollars * 1_000_000.0).round() as u64;
     let keypair_path = arg(&args, "--keypair").expect(USAGE);
     let keypair = read_keypair_file(&keypair_path).expect("cannot read keypair");
@@ -121,6 +137,16 @@ fn main() {
         Some(url) => Cluster::Custom(url.clone(), url.replace("https", "wss")),
         None => Cluster::Devnet,
     };
+
+    // SPEC.md 8.3: a voucher is a signature, made offline.
+    if command == "voucher" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        let units: u64 = args[3].parse().expect("amount in dollar units");
+        let signature = keypair.sign_message(&sasona::voucher_message(&channel, units));
+        println!("{}", signature.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>());
+        return;
+    }
+    let voucher_signer = arg(&args, "--signer").map(|p| read_keypair_file(&p).expect("cannot read signer keypair"));
 
     let me = keypair.pubkey();
     let client = Client::new_with_options(cluster, Rc::new(keypair), CommitmentConfig::finalized());
@@ -682,6 +708,117 @@ fn main() {
                 second,
             })
             .args(sasona::instruction::SettlePair {})
+    } else if command == "open-channel" {
+        let payee: Pubkey = args[2].parse().expect("payee address");
+        let id: u64 = args[3].parse().expect("identifier");
+        let put_in = (args[4].parse::<f64>().expect("dollars") * 1_000_000.0).round() as u64;
+        let signer = voucher_signer.as_ref().map(|k| k.pubkey()).unwrap_or(me);
+        let channel = pda(&[CHANNEL_SEED, me.as_ref(), payee.as_ref(), &id.to_le_bytes()]);
+        eprintln!("channel {channel}");
+        let r = request
+            .accounts(sasona::accounts::OpenChannel {
+                payer: me,
+                voucher_signer: signer,
+                payer_usd: get_associated_token_address(&me, &USD_MINT),
+                usd_mint: USD_MINT,
+                record: pda(&[PAYER_SEED, me.as_ref()]),
+                channel,
+                channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::OpenChannel { payee, id, amount: put_in });
+        match &voucher_signer {
+            Some(k) => r.signer(k.insecure_clone()),
+            None => r,
+        }
+    } else if command == "add-to-channel" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        let more = (args[3].parse::<f64>().expect("dollars") * 1_000_000.0).round() as u64;
+        request
+            .accounts(sasona::accounts::AddToChannel {
+                payer: me,
+                payer_usd: get_associated_token_address(&me, &USD_MINT),
+                channel,
+                channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::AddToChannel { amount: more })
+    } else if command == "take-payment" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        let units: u64 = args[3].parse().expect("amount in dollar units");
+        let signature = unhex::<64>(&args[4]);
+        let c: sasona::Channel = program.account(channel).expect("channel");
+        // SPEC.md 8.6: one signature, with the key, the signature and the
+        // message in this same instruction: key at 16, signature at 48,
+        // message at 112.
+        let mut data = vec![1u8, 0];
+        for f in [48u16, u16::MAX, 16, u16::MAX, 112, sasona::VOUCHER_LEN as u16, u16::MAX] {
+            data.extend(f.to_le_bytes());
+        }
+        data.extend(c.signer.as_ref());
+        data.extend(signature);
+        data.extend(sasona::voucher_message(&channel, units));
+        let check = anchor_client::Instruction { program_id: ED25519, accounts: vec![], data };
+        request
+            .instruction(check)
+            .accounts(sasona::accounts::TakePayment {
+                channel,
+                channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
+                payee_usd: get_associated_token_address(&c.payee, &USD_MINT),
+                instructions: INSTRUCTIONS,
+                token_program: anchor_spl::token::ID,
+            })
+            .args(sasona::instruction::TakePayment { amount: units })
+    } else if command == "sweep-channel" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        request
+            .accounts(sasona::accounts::SweepChannel {
+                caller: me,
+                channel,
+                channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
+                fees: pda(&[FEES_SEED]),
+                markup: pda(&[MARKUP_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::SweepChannel {})
+    } else if command == "ask-close-channel" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        request
+            .accounts(sasona::accounts::AskToCloseChannel { payer: me, channel })
+            .args(sasona::instruction::AskToCloseChannel {})
+    } else if command == "close-channel" {
+        let channel: Pubkey = args[2].parse().expect("channel address");
+        let c: sasona::Channel = program.account(channel).expect("channel");
+        request
+            .accounts(sasona::accounts::CloseChannel {
+                closer: me,
+                payer: c.payer,
+                payer_usd: get_associated_token_address(&c.payer, &USD_MINT),
+                channel,
+                channel_usd: pda(&[CHANNEL_USD_SEED, channel.as_ref()]),
+                fees: pda(&[FEES_SEED]),
+                markup: pda(&[MARKUP_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::CloseChannel {})
+    } else if command == "settle-markup" {
+        request
+            .accounts(sasona::accounts::SettleMarkup {
+                caller: me,
+                pool: pda(&[POOL_SEED]),
+                coin_mint: coin,
+                pool_usd: pda(&[POOL_USD_SEED]),
+                pool_coin: pda(&[POOL_COIN_SEED]),
+                fees: pda(&[FEES_SEED]),
+                markup: pda(&[MARKUP_SEED]),
+                network: pda(&[NETWORK_SEED]),
+                token_program: anchor_spl::token::ID,
+                system_program: anchor_client::anchor_lang::system_program::ID,
+            })
+            .args(sasona::instruction::SettleMarkup {})
     } else if command == "settle" {
         request
             .accounts(sasona::accounts::SettleEntryFees {

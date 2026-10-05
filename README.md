@@ -43,13 +43,19 @@ While on devnet the program can still be upgraded by its deployer. Each proof in
 | `answer_challenge` | Holds if the reply on chain hashes to what was recorded and gives the recorded verdict for the nonce. The bond goes to the member and the reply is sealed. |
 | `uphold_challenge` | After 7 days with no answer that held: the reading stops counting and the membership loses its stake. What it owes the cover comes out first, a tenth of the rest goes to the challenger, and the rest to the cover. |
 | `set_quote` | The member who took a reading sets, changes or withdraws what they would charge to insure a purchase from the service, in basis points. Only on a reading that says delivered, within 30 days, while the member is active. |
-| `buy` | A purchase covered by a quote. The price goes to the address the reading recorded, the premium to the member who quoted. Refused past the member's room to insure, or if the quote was raised past the rate the buyer accepts. |
+| `buy` | A purchase covered by a quote. The price goes to the address the reading recorded, the premium to the member who quoted, and the 15% markup to the network. Refused past the member's room to insure, or if the quote was raised past the rate the buyer accepts. |
 | `close_purchase` | After 7 days with no chargeback, gives the member back the room the purchase took. Anyone can call it. |
 | `charge_back` | Within 7 days, the buyer asks for the price back, with a 5% deposit unless nobody charged back the service in the last 30 days. Draws a member to replay the service. |
 | `record_draw` | Records the entropy of a replay's draw, which fixes the member drawn. |
 | `commit_replay` | The drawn member commits a reading of the service, as for a round. It is revealed with `reveal_reading`. |
 | `pass_draw` | After the hour to read, counts a draw nobody used, and draws again. After 8 the chargeback can be settled. |
 | `settle_chargeback` | Pays out what the replay decided: the buyer back out of the cover, or the deposit to the replayer. 7 days with no replay pays the buyer. |
+| `open_channel` | Puts a payer's dollars in a channel for one payee, paid out against vouchers a named key signs offline. Each payer's channels take identifiers in order, so no channel address is ever used twice. |
+| `add_to_channel` | The payer adds dollars, while no close is pending. |
+| `take_payment` | Pays the payee against a voucher, checked by the ed25519 program in the instruction before. A voucher is cumulative, and pays what the channel can cover. The markup on what was taken is kept in the channel, owed to the network. |
+| `sweep_channel` | Moves a channel's markup owed to the network's fee account. Anyone can call it. |
+| `ask_to_close_channel`, `close_channel` | The payee may close at any time. The payer asks, and after 648,000 slots, about 72 hours, anyone may close. What is left, and the rent, go back to the payer. |
+| `settle_markup` | Turns the markup into coin: 5 of its 15 points stay in the pool, and the rest buys coin, 3% burned. |
 | `repay_cover` | Once the covering reading can no longer be challenged, takes what the member owes the cover out of their stake. A membership left with less than a whole stake leaves its seat. |
 
 A deposit is split four ways:
@@ -64,7 +70,7 @@ A deposit is split four ways:
 ## Temporary, and will change
 
 - None of the participant roles exists on chain yet, so their share of every fee goes to the network, and the network's coin waits in a vault held by the pool with no way out. Both change when developers, members, submitters and marketers come on chain.
-- Any caller can pay any fee, because there is no purchase on chain to tie it to yet. It has to be tied to real purchases before participants are paid.
+- Covered purchases and channels now pay the markup on chain, but a markup proves only that someone paid it: a buyer can buy from their own address, and a payer can pay an address of their own. So the participants' share of every markup goes to the network until purchases can be told apart from a participant paying itself. `pay_fee` still lets anyone pay a markup with no purchase at all.
 - Each reading is taken by the member drawn for it, but the round's opener still writes the list and picks when to open it.
 - The stake, the challenge bond, the challenger's tenth, the minimum covered price and the 5% are devnet figures. A stake that deters has to grow with the traffic a service carries, now that purchases are on chain.
 - Once its notice has run out, a guarantee can be released just ahead of a claim its owner can see coming. Releases do not pause yet while a chargeback is open.
